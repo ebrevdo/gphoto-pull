@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gphoto-pull"
+version = "0.1.0"
+description = "Browser-automation tooling for pulling recent media from Google Photos."
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "msgspec>=0.21.1",
+    "platformdirs>=4.9.6",
+    "playwright>=1.52",
+    "python-dateutil>=2.9.0.post0",
+    "rich>=15.0.0",
+    "tyro>=1.0.12",
+]
+
+[project.scripts]
+gphoto-pull = "gphoto_pull.cli:main"
+
+[dependency-groups]
+dev = [
+    "pyright>=1.1.401",
+    "ruff>=0.11",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+target-version = "py313"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["ARG", "B", "E", "F", "I", "N", "SIM", "UP"]
+
+[tool.pyright]
+include = ["src", "tests"]
+pythonVersion = "3.13"
+typeCheckingMode = "strict"
+venvPath = "."
+venv = ".venv"

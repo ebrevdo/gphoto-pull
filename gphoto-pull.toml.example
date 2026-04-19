@@ -1,0 +1,19 @@
+# Optional local defaults for gphoto-pull.
+# Command-line options override these values.
+
+# Omit this to download into the current working directory.
+# download_dir = "downloads"
+download_concurrency = 4
+sync_db_path = "state/pull-state.sqlite3"
+diagnostics_dir = "diagnostics"
+browsers_path = "browsers"
+browser_profile_dir = "chrome-profile"
+headless = true
+
+# Prefer passing --after/--before per run unless you always want the same window.
+# Missing time defaults to midnight; missing timezone defaults to local timezone.
+# after = "Jan 1 2026"
+# before = "Feb 1 2026"
+
+# Set only if Playwright cannot launch its installed Chromium.
+# browser_binary = "/path/to/chromium"
