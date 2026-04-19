@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 import os
 import shutil
+import sqlite3
 import subprocess
 import sys
 from collections.abc import Sequence
@@ -659,12 +660,19 @@ def _reset_paths_for_target(config: ProjectConfig, *, target: str) -> tuple[Path
         Paths to delete for the target.
     """
 
+    index_paths = (
+        config.sync_db_path,
+        config.sync_db_path.with_name(f"{config.sync_db_path.name}-wal"),
+        config.sync_db_path.with_name(f"{config.sync_db_path.name}-shm"),
+        config.sync_db_path.with_name(f"{config.sync_db_path.name}-journal"),
+    )
+
     if target == "all":
-        return (config.browser_profile_dir, config.sync_db_path)
+        return (config.browser_profile_dir, *index_paths)
     if target == "profile":
         return (config.browser_profile_dir,)
     if target == "index":
-        return (config.sync_db_path,)
+        return index_paths
     if target == "browsers":
         return (config.browsers_path,)
     if target == "browser":
@@ -875,6 +883,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     except BrowserSessionError as exc:
         print(f"Browser session error: {exc}", file=sys.stderr)
         return 3
+    except sqlite3.Error as exc:
+        print(
+            "Media index error: "
+            f"{exc}. Stop any running gphoto-pull process, run "
+            "`gphoto-pull reset --target index --yes`, then rerun the command.",
+            file=sys.stderr,
+        )
+        return 4
     except KeyboardInterrupt:
         print("Interrupted.", file=sys.stderr)
         return 130

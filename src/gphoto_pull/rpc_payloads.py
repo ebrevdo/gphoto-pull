@@ -7,11 +7,13 @@ Description:
 
 from __future__ import annotations
 
-import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
+
+import msgspec
+import msgspec.json
 
 INIT_REQUEST_PATTERN = re.compile(r"'(?P<ds_key>ds:\d+)'\s*:\s*\{id:'(?P<rpcid>[^']+)'")
 RECENT_CANONICAL_RE = re.compile(r'https://photos\.google\.com/search/([^"<]+)')
@@ -137,8 +139,8 @@ class BatchedRpcFrame:
         if self.payload_text is None:
             return None
         try:
-            return cast(JsonValue, json.loads(self.payload_text))
-        except json.JSONDecodeError:
+            return _decode_json_value(self.payload_text)
+        except RpcPayloadParseError:
             return None
 
 
@@ -261,7 +263,7 @@ def parse_batchexecute_frames(raw_text: str) -> tuple[BatchedRpcFrame, ...]:
         if not stripped.startswith("["):
             continue
 
-        payload = cast(JsonValue, json.loads(stripped))
+        payload = _decode_json_value(stripped)
         if not isinstance(payload, list):
             continue
 
@@ -280,6 +282,23 @@ def parse_batchexecute_frames(raw_text: str) -> tuple[BatchedRpcFrame, ...]:
         raise RpcPayloadParseError("Could not identify any batchexecute frames.")
 
     return tuple(frames)
+
+
+def _decode_json_value(raw_text: str) -> JsonValue:
+    """Description:
+    Decode unknown Google JSON into the recursive JSON value surface.
+
+    Args:
+        raw_text: JSON text.
+
+    Returns:
+        Decoded JSON value.
+    """
+
+    try:
+        return cast(JsonValue, msgspec.json.decode(raw_text.encode()))
+    except msgspec.DecodeError as exc:
+        raise RpcPayloadParseError(str(exc)) from exc
 
 
 def parse_recent_payload(raw_text: str) -> RecentPayload:

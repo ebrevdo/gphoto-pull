@@ -1,9 +1,9 @@
-import json
 import unittest
 from datetime import datetime
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+import msgspec.json
 from gphoto_pull.enumeration import enumerate_saved_candidates
 from gphoto_pull.photos_ui import PhotosSurface, extract_photo_locations_from_html
 from gphoto_pull.rpc_payloads import JsonValue
@@ -13,7 +13,10 @@ DIAGNOSTICS_DIR = Path(".state/diagnostics")
 
 
 def _recent_batchexecute_frame(items: list[list[JsonValue]]) -> str:
-    return json.dumps([["wrb.fr", "opaqueRecentRpc", json.dumps([items]), None, None, None]])
+    payload_text = msgspec.json.encode([items]).decode()
+    return msgspec.json.encode(
+        [["wrb.fr", "opaqueRecentRpc", payload_text, None, None, None]]
+    ).decode()
 
 
 class SavedEnumerationTests(unittest.TestCase):

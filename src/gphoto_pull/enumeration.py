@@ -149,6 +149,47 @@ def enumerate_saved_candidates(
     )
 
 
+def enumerate_index_candidates(
+    records: list[MediaStateRecord],
+    *,
+    after: datetime,
+    before: datetime | None,
+) -> EnumerationSummary:
+    """Description:
+    Build an enumeration summary from already-indexed media records.
+
+    Args:
+        records: Media index records to summarize.
+        after: Inclusive lower-bound timestamp.
+        before: Optional exclusive upper-bound timestamp.
+
+    Returns:
+        Enumeration summary suitable for queue construction.
+    """
+
+    candidates = tuple(
+        EnumeratedCandidate(
+            metadata=record.metadata,
+            source="media-index",
+            uploaded_time_exact=record.metadata.uploaded_time is not None,
+            cutoff_match=_timestamp_in_window(
+                record.metadata.uploaded_time,
+                after=after,
+                before=before,
+            ),
+        )
+        for record in records
+    )
+    return EnumerationSummary(
+        candidates=candidates,
+        persisted_records=tuple(records),
+        source_counts=_count_sources(list(candidates)),
+        exact_uploaded_time_count=sum(candidate.uploaded_time_exact for candidate in candidates),
+        unknown_uploaded_time_count=sum(candidate.cutoff_match is None for candidate in candidates),
+        cutoff_matched_count=sum(candidate.cutoff_match is True for candidate in candidates),
+    )
+
+
 def _enumerate_recent_candidates(
     html: str,
     payload: RecentPayload | None,

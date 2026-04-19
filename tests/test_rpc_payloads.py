@@ -1,7 +1,7 @@
-import json
 import unittest
 from pathlib import Path
 
+import msgspec.json
 from gphoto_pull.rpc_payloads import (
     JsonValue,
     extract_init_data_requests,
@@ -15,7 +15,10 @@ LEGACY_UPDATES_PATH = DIAGNOSTICS_DIR / "updates-frGlJf.txt"
 
 
 def _recent_batchexecute_frame(items: list[list[JsonValue]]) -> str:
-    return json.dumps([["wrb.fr", "opaqueRecentRpc", json.dumps([items]), None, None, None]])
+    payload_text = msgspec.json.encode([items]).decode()
+    return msgspec.json.encode(
+        [["wrb.fr", "opaqueRecentRpc", payload_text, None, None, None]]
+    ).decode()
 
 
 class RpcPayloadFixtureTests(unittest.TestCase):

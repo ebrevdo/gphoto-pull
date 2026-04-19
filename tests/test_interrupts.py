@@ -23,15 +23,18 @@ class InterruptHandlingTests(unittest.TestCase):
             with self.assertRaises(KeyboardInterrupt):
                 raise_if_interrupt_requested()
 
-    def test_second_sigint_raises_keyboard_interrupt(self) -> None:
+    def test_repeated_sigint_remains_cooperative(self) -> None:
         with cooperative_sigint_handling():
             handler = signal.getsignal(signal.SIGINT)
             self.assertTrue(callable(handler))
             assert callable(handler)
 
             handler(signal.SIGINT, None)
+            handler(signal.SIGINT, None)
+
+            self.assertTrue(interrupt_requested())
             with self.assertRaises(KeyboardInterrupt):
-                handler(signal.SIGINT, None)
+                raise_if_interrupt_requested()
 
 
 if __name__ == "__main__":

@@ -8,7 +8,6 @@ Description:
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import sys
 import urllib.parse
@@ -22,6 +21,9 @@ from time import perf_counter
 from typing import TYPE_CHECKING, cast
 from urllib.parse import urlsplit, urlunsplit
 
+import msgspec
+import msgspec.json
+
 from gphoto_pull.browser import (
     BrowserSessionError,
     BrowserSessionPaths,
@@ -32,6 +34,7 @@ from gphoto_pull.browser import (
     require_browser_binaries,
 )
 from gphoto_pull.config import ConfigError, ProjectConfig
+from gphoto_pull.detail_payloads import DetailMetadata, parse_detail_metadata
 from gphoto_pull.download import (
     DownloadError,
     DownloadPlan,
@@ -39,7 +42,11 @@ from gphoto_pull.download import (
     finalize_download,
     plan_download_target,
 )
-from gphoto_pull.enumeration import EnumerationSummary, enumerate_saved_candidates
+from gphoto_pull.enumeration import (
+    EnumerationSummary,
+    enumerate_index_candidates,
+    enumerate_saved_candidates,
+)
 from gphoto_pull.interrupts import (
     add_interrupt_callback,
     interrupt_requested,
@@ -48,6 +55,7 @@ from gphoto_pull.interrupts import (
 )
 from gphoto_pull.models import DownloadTrace, MediaMetadata, MediaStateRecord
 from gphoto_pull.photos_ui import (
+    PHOTOS_APP_ORIGIN,
     RECENTLY_ADDED_URL,
     UPDATES_URL,
     GooglePhotosUi,
@@ -70,6 +78,7 @@ from gphoto_pull.rpc_payloads import (
     parse_updates_payload,
 )
 from gphoto_pull.state import PullStateStore
+from gphoto_pull.takeout import write_takeout_sidecar
 
 LOGGER = logging.getLogger(__name__)
 
@@ -172,6 +181,7 @@ class _PendingDownload:
         plan: Final target plan for the artifact.
         download: Playwright download handle.
         download_trace: Captured download network metadata.
+        detail_metadata: Detail metadata captured while opening the detail menu.
         queued_at: Monotonic timestamp when the item entered a worker slot.
         start_begin_at: Monotonic timestamp when browser download triggering began.
         download_event_at: Monotonic timestamp when Playwright produced the download handle.
@@ -184,6 +194,7 @@ class _PendingDownload:
     plan: DownloadPlan
     download: AsyncDownload
     download_trace: DownloadTrace
+    detail_metadata: DetailMetadata | None
     queued_at: float
     start_begin_at: float
     download_event_at: float
@@ -243,6 +254,113 @@ class _RecentPageCursor:
 
     rpc_id: str
     cursor: str
+
+
+class _DownloadTraceJson(msgspec.Struct, frozen=True):
+    """Download trace JSON payload.
+
+    Description:
+        Serialized network details for one download attempt.
+
+    Attributes:
+        download_url: URL reported by Playwright's download handle.
+        final_url: Best matched response URL.
+        content_type: Response content type.
+        content_length: Response content length.
+        content_disposition: Response content disposition.
+    """
+
+    download_url: str | None
+    final_url: str | None
+    content_type: str | None
+    content_length: int | None
+    content_disposition: str | None
+
+
+class _DownloadTraceArtifact(msgspec.Struct, frozen=True):
+    """Download trace artifact JSON payload.
+
+    Description:
+        Owned JSON artifact written under diagnostics for endpoint analysis.
+
+    Attributes:
+        media_id: Google Photos media key.
+        filename: Local filename chosen for the download.
+        product_url: Google Photos product/detail URL when known.
+        page_url: Direct or detail page URL used to start the download.
+        download_trace: Captured download network metadata.
+    """
+
+    media_id: str
+    filename: str
+    product_url: str | None
+    page_url: str
+    download_trace: _DownloadTraceJson
+
+
+@dataclass(slots=True)
+class _RecentPayloadStats:
+    """Running recent payload statistics.
+
+    Description:
+        Tracks unique media ids and oldest upload time without reparsing all
+        previous response bodies on every page.
+
+    Attributes:
+        media_ids: Unique media ids seen so far.
+        oldest_upload_time: Oldest upload timestamp seen so far.
+    """
+
+    media_ids: set[str]
+    oldest_upload_time: datetime | None = None
+
+    @property
+    def item_count(self) -> int:
+        """Description:
+        Count unique media ids seen so far.
+
+        Returns:
+            Unique media item count.
+        """
+
+        return len(self.media_ids)
+
+
+@dataclass(slots=True, frozen=True)
+class _RecentPaginationStart:
+    """Starting point for direct recent pagination.
+
+    Description:
+        Describes either a normal first-page continuation or a stored checkpoint
+        continuation.
+
+    Attributes:
+        cursor: Cursor to request next.
+        page_count: Page count to use for progress logs.
+        from_checkpoint: Whether this start came from a stored checkpoint.
+    """
+
+    cursor: _RecentPageCursor
+    page_count: int
+    from_checkpoint: bool = False
+
+
+@dataclass(slots=True, frozen=True)
+class _RecentPaginationResult:
+    """Direct recent pagination outcome.
+
+    Description:
+        Separates successful completion from a checkpoint that should be ignored
+        for the current run.
+
+    Attributes:
+        completed: Whether pagination reached a normal stop condition.
+        checkpoint_invalid: Whether a checkpoint path should be retried from
+            the normal first-page cursor.
+    """
+
+    completed: bool
+    checkpoint_invalid: bool = False
 
 
 class GooglePhotosPuller:
@@ -431,7 +549,7 @@ class GooglePhotosPuller:
 
         try:
             execution = asyncio.run(self._pull_live_interruptible(paths, lines))
-        except asyncio.CancelledError as exc:
+        except (asyncio.CancelledError, KeyboardInterrupt) as exc:
             raise KeyboardInterrupt from exc
 
         lines.append(
@@ -478,7 +596,10 @@ class GooglePhotosPuller:
         )
         require_browser_binaries(paths, browser_binary=self.config.browser_binary)
 
-        asyncio.run(self._refresh_live(paths, lines))
+        try:
+            asyncio.run(self._refresh_live(paths, lines))
+        except (asyncio.CancelledError, KeyboardInterrupt) as exc:
+            raise KeyboardInterrupt from exc
         return lines
 
     async def _pull_live_interruptible(
@@ -547,87 +668,136 @@ class GooglePhotosPuller:
         ) as context:
             if self.config.after is None:
                 raise ConfigError("`after` is required before running a pull.")
-            LOGGER.log(PHASE_LOG_LEVEL, "Capturing Recently added diagnostics.")
-            recent_page = await context.new_page()
-            recent_response_count = await _capture_recent_probe_async(
-                recent_page,
-                diagnostics_dir=self.config.diagnostics_dir,
-                photos_ui=self.photos_ui,
-                after=self.config.after,
-            )
-            await recent_page.close()
-
-            LOGGER.log(PHASE_LOG_LEVEL, "Capturing Updates diagnostics.")
-            updates_page = await context.new_page()
-            updates_response_count = await _capture_updates_probe_async(
-                updates_page,
-                diagnostics_dir=self.config.diagnostics_dir,
-            )
-            await updates_page.close()
-
-            lines.append(
-                "Captured live diagnostics: "
-                f"recent batchexecute responses={recent_response_count}, "
-                f"updates batchexecute responses={updates_response_count}"
-            )
-
             with PullStateStore(self.config.sync_db_path) as state_store:
-                LOGGER.log(PHASE_LOG_LEVEL, "Enumerating live candidates.")
-                summary = enumerate_saved_candidates(
-                    diagnostics_dir=self.config.diagnostics_dir,
-                    after=self.config.after,
-                    before=self.config.before,
-                    state_store=state_store,
-                )
-                lines.extend(
-                    _enumeration_summary_lines(
-                        summary,
-                        self.config.sync_db_path,
-                        label_prefix="Live",
+                if state_store.upload_coverage_satisfies(self.config.after):
+                    LOGGER.log(PHASE_LOG_LEVEL, "Using covered media index.")
+                    records = state_store.list_media_in_upload_window(
+                        after=self.config.after,
+                        before=self.config.before,
                     )
-                )
+                    summary = enumerate_index_candidates(
+                        records,
+                        after=self.config.after,
+                        before=self.config.before,
+                    )
+                    lines.extend(
+                        _enumeration_summary_lines(
+                            summary,
+                            self.config.sync_db_path,
+                            label_prefix="Indexed",
+                        )
+                    )
+                else:
+                    LOGGER.log(PHASE_LOG_LEVEL, "Capturing Recently added diagnostics.")
+                    recent_page = await context.new_page()
+                    recent_response_count = await _capture_recent_probe_async(
+                        recent_page,
+                        diagnostics_dir=self.config.diagnostics_dir,
+                        photos_ui=self.photos_ui,
+                        after=self.config.after,
+                        state_store=state_store,
+                    )
+                    await recent_page.close()
 
-                LOGGER.log(PHASE_LOG_LEVEL, "Building download queue.")
-                queue, skipped_existing_count = _build_download_queue(
-                    summary,
-                    download_dir=self.config.download_dir,
-                )
-                lines.append(
-                    "Download queue: "
-                    f"{len(queue)} cutoff-matched candidates, "
-                    f"{skipped_existing_count} already-downloaded"
-                )
+                    LOGGER.log(PHASE_LOG_LEVEL, "Capturing Updates diagnostics.")
+                    updates_page = await context.new_page()
+                    updates_response_count = await _capture_updates_probe_async(
+                        updates_page,
+                        diagnostics_dir=self.config.diagnostics_dir,
+                    )
+                    await updates_page.close()
 
-                if not queue:
-                    return PullExecutionSummary(
-                        queued_count=0,
-                        skipped_existing_count=skipped_existing_count,
-                        downloaded_count=0,
-                        failed_count=0,
-                        failure_media_ids=(),
+                    lines.append(
+                        "Captured live diagnostics: "
+                        f"recent batchexecute responses={recent_response_count}, "
+                        f"updates batchexecute responses={updates_response_count}"
                     )
 
-                download_concurrency = _bounded_download_concurrency(
-                    self.config.download_concurrency,
-                    len(queue),
-                )
-                lines.append(f"Download workers: {download_concurrency} async download workers")
-                LOGGER.log(
-                    PHASE_LOG_LEVEL,
-                    "Starting downloads with %s worker(s).",
-                    download_concurrency,
-                )
-                execution = await _download_candidates_async(
-                    context,
-                    diagnostics_dir=self.config.diagnostics_dir,
-                    download_dir=self.config.download_dir,
-                    state_store=state_store,
-                    photos_ui=self.photos_ui,
-                    queued_candidates=queue,
-                    download_concurrency=download_concurrency,
-                    progress_interactive=self.config.progress_interactive,
-                )
-                return replace(execution, skipped_existing_count=skipped_existing_count)
+                    LOGGER.log(PHASE_LOG_LEVEL, "Querying refreshed media index.")
+                    records = state_store.list_media_in_upload_window(
+                        after=self.config.after,
+                        before=self.config.before,
+                    )
+                    summary = enumerate_index_candidates(
+                        records,
+                        after=self.config.after,
+                        before=self.config.before,
+                    )
+                    lines.extend(
+                        _enumeration_summary_lines(
+                            summary,
+                            self.config.sync_db_path,
+                            label_prefix="Indexed",
+                        )
+                    )
+
+                return await self._download_summary_candidates(context, state_store, summary, lines)
+
+    async def _download_summary_candidates(
+        self,
+        context: AsyncBrowserContext,
+        state_store: PullStateStore,
+        summary: EnumerationSummary,
+        lines: list[str],
+    ) -> PullExecutionSummary:
+        """Description:
+        Build and execute a download queue from an enumeration summary.
+
+        Args:
+            context: Browser context used by download workers.
+            state_store: Open media index.
+            summary: Candidate summary to download.
+            lines: Mutable summary lines to append to.
+
+        Returns:
+            Pull execution counters.
+
+        Side Effects:
+            Reads target-file metadata, downloads files, and appends summary
+            lines.
+        """
+
+        LOGGER.log(PHASE_LOG_LEVEL, "Building download queue.")
+        queue, skipped_existing_count = _build_download_queue(
+            summary,
+            download_dir=self.config.download_dir,
+        )
+        lines.append(
+            "Download queue: "
+            f"{len(queue)} cutoff-matched candidates, "
+            f"{skipped_existing_count} already-downloaded"
+        )
+
+        if not queue:
+            return PullExecutionSummary(
+                queued_count=0,
+                skipped_existing_count=skipped_existing_count,
+                downloaded_count=0,
+                failed_count=0,
+                failure_media_ids=(),
+            )
+
+        download_concurrency = _bounded_download_concurrency(
+            self.config.download_concurrency,
+            len(queue),
+        )
+        lines.append(f"Download workers: {download_concurrency} async download workers")
+        LOGGER.log(
+            PHASE_LOG_LEVEL,
+            "Starting downloads with %s worker(s).",
+            download_concurrency,
+        )
+        execution = await _download_candidates_async(
+            context,
+            diagnostics_dir=self.config.diagnostics_dir,
+            download_dir=self.config.download_dir,
+            state_store=state_store,
+            photos_ui=self.photos_ui,
+            queued_candidates=queue,
+            download_concurrency=download_concurrency,
+            progress_interactive=self.config.progress_interactive,
+        )
+        return replace(execution, skipped_existing_count=skipped_existing_count)
 
     async def _refresh_live(self, paths: BrowserSessionPaths, lines: list[str]) -> None:
         """Description:
@@ -649,37 +819,41 @@ class GooglePhotosPuller:
         ) as context:
             if self.config.after is None:
                 raise ConfigError("`after` is required before running refresh.")
-            LOGGER.log(PHASE_LOG_LEVEL, "Capturing Recently added diagnostics.")
-            recent_page = await context.new_page()
-            recent_response_count = await _capture_recent_probe_async(
-                recent_page,
-                diagnostics_dir=self.config.diagnostics_dir,
-                photos_ui=self.photos_ui,
-                after=self.config.after,
-            )
-            await recent_page.close()
-
-            LOGGER.log(PHASE_LOG_LEVEL, "Capturing Updates diagnostics.")
-            updates_page = await context.new_page()
-            updates_response_count = await _capture_updates_probe_async(
-                updates_page,
-                diagnostics_dir=self.config.diagnostics_dir,
-            )
-            await updates_page.close()
-
-            lines.append(
-                "Captured live diagnostics: "
-                f"recent batchexecute responses={recent_response_count}, "
-                f"updates batchexecute responses={updates_response_count}"
-            )
-
             with PullStateStore(self.config.sync_db_path) as state_store:
-                LOGGER.log(PHASE_LOG_LEVEL, "Refreshing media index.")
-                summary = enumerate_saved_candidates(
+                LOGGER.log(PHASE_LOG_LEVEL, "Capturing Recently added diagnostics.")
+                recent_page = await context.new_page()
+                recent_response_count = await _capture_recent_probe_async(
+                    recent_page,
                     diagnostics_dir=self.config.diagnostics_dir,
+                    photos_ui=self.photos_ui,
+                    after=self.config.after,
+                    state_store=state_store,
+                )
+                await recent_page.close()
+
+                LOGGER.log(PHASE_LOG_LEVEL, "Capturing Updates diagnostics.")
+                updates_page = await context.new_page()
+                updates_response_count = await _capture_updates_probe_async(
+                    updates_page,
+                    diagnostics_dir=self.config.diagnostics_dir,
+                )
+                await updates_page.close()
+
+                lines.append(
+                    "Captured live diagnostics: "
+                    f"recent batchexecute responses={recent_response_count}, "
+                    f"updates batchexecute responses={updates_response_count}"
+                )
+
+                LOGGER.log(PHASE_LOG_LEVEL, "Querying refreshed media index.")
+                records = state_store.list_media_in_upload_window(
                     after=self.config.after,
                     before=self.config.before,
-                    state_store=state_store,
+                )
+                summary = enumerate_index_candidates(
+                    records,
+                    after=self.config.after,
+                    before=self.config.before,
                 )
                 lines.extend(
                     _enumeration_summary_lines(
@@ -968,6 +1142,7 @@ async def _capture_recent_probe_async(
     diagnostics_dir: Path,
     photos_ui: GooglePhotosUi,
     after: datetime,
+    state_store: PullStateStore | None = None,
 ) -> int:
     """Description:
     Visit Recently Added and capture live batchexecute diagnostics.
@@ -977,6 +1152,7 @@ async def _capture_recent_probe_async(
         diagnostics_dir: Diagnostics directory root.
         photos_ui: Google Photos UI adapter.
         after: Inclusive lower-bound timestamp for deciding scroll depth.
+        state_store: Optional media index used for cursor checkpoint resume.
 
     Returns:
         Number of captured recent batchexecute responses.
@@ -1044,6 +1220,7 @@ async def _capture_recent_probe_async(
             capture,
             recent_page_requests,
             after=after,
+            state_store=state_store,
         ):
             break
 
@@ -1166,7 +1343,7 @@ async def _capture_updates_probe_async(
 
 def _install_batchexecute_capture_async(
     page: AsyncPage,
-    parser: Callable[[str], RecentPayload | UpdatesPayload],
+    parser: Callable[[str], object],
 ) -> _AsyncResponseCapture:
     """Description:
     Attach a response listener that records parseable Photos batchexecute bodies.
@@ -1261,7 +1438,7 @@ def _install_recent_page_request_capture(page: AsyncPage) -> list[_RecentPageReq
 async def _capture_batchexecute_response(
     response: AsyncResponse,
     *,
-    parser: Callable[[str], RecentPayload | UpdatesPayload],
+    parser: Callable[[str], object],
     response_texts: list[str],
     accepted_event: asyncio.Event,
 ) -> None:
@@ -1318,6 +1495,7 @@ async def _page_recent_payloads_to_window(
     recent_page_requests: list[_RecentPageRequest],
     *,
     after: datetime,
+    state_store: PullStateStore | None,
 ) -> bool:
     """Description:
     Fetch older Recently Added pages directly until the requested window is reached.
@@ -1327,6 +1505,7 @@ async def _page_recent_payloads_to_window(
         capture: Response capture state whose texts are extended.
         recent_page_requests: Browser-originated recent request templates.
         after: Inclusive lower-bound timestamp.
+        state_store: Optional media index used for cursor checkpoint resume.
 
     Returns:
         `True` when direct pagination reached the requested lower bound or feed end.
@@ -1340,18 +1519,113 @@ async def _page_recent_payloads_to_window(
     if not recent_page_requests:
         return False
 
-    cursor = _recent_payload_cursor(capture.response_texts[-1]) if capture.response_texts else None
-    if cursor is None:
+    normal_cursor = (
+        _recent_payload_cursor(capture.response_texts[-1]) if capture.response_texts else None
+    )
+    if normal_cursor is None:
         return False
+
+    current_rpc_ids = tuple(dict.fromkeys(request.rpc_id for request in recent_page_requests))
+    checkpoint = (
+        state_store.best_recent_page_checkpoint(after=after, rpc_ids=current_rpc_ids)
+        if state_store is not None
+        else None
+    )
+    if checkpoint is not None:
+        LOGGER.log(
+            PHASE_LOG_LEVEL,
+            "Recent direct pagination resuming from checkpoint: page=%s oldest_upload=%s",
+            checkpoint.page_count,
+            checkpoint.oldest_upload_time.isoformat(),
+        )
+        checkpoint_start = _RecentPaginationStart(
+            cursor=_RecentPageCursor(rpc_id=checkpoint.rpc_id, cursor=checkpoint.cursor),
+            page_count=checkpoint.page_count,
+            from_checkpoint=True,
+        )
+        try:
+            checkpoint_result = await _page_recent_payloads_from_start(
+                request_context,
+                capture,
+                recent_page_requests,
+                start=checkpoint_start,
+                after=after,
+                state_store=state_store,
+            )
+        except KeyboardInterrupt:
+            raise
+        except Exception as exc:
+            LOGGER.log(
+                PHASE_LOG_LEVEL,
+                "Recent direct checkpoint failed; retrying from first page: %s",
+                exc,
+            )
+            checkpoint_result = _RecentPaginationResult(
+                completed=False,
+                checkpoint_invalid=True,
+            )
+        if checkpoint_result.completed:
+            return True
+        if not checkpoint_result.checkpoint_invalid:
+            return False
+        LOGGER.log(PHASE_LOG_LEVEL, "Recent direct checkpoint ignored for this run.")
+
+    return (
+        await _page_recent_payloads_from_start(
+            request_context,
+            capture,
+            recent_page_requests,
+            start=_RecentPaginationStart(cursor=normal_cursor, page_count=0),
+            after=after,
+            state_store=state_store,
+        )
+    ).completed
+
+
+async def _page_recent_payloads_from_start(
+    request_context: APIRequestContext,
+    capture: _AsyncResponseCapture,
+    recent_page_requests: list[_RecentPageRequest],
+    *,
+    start: _RecentPaginationStart,
+    after: datetime,
+    state_store: PullStateStore | None,
+) -> _RecentPaginationResult:
+    """Description:
+    Fetch direct recent pages from one starting cursor.
+
+    Args:
+        request_context: Browser request context carrying Google auth.
+        capture: Response capture state whose texts are extended.
+        recent_page_requests: Browser-originated recent request templates.
+        start: Cursor and page count to start from.
+        after: Inclusive lower-bound timestamp.
+        state_store: Optional media index used for cursor checkpoints.
+
+    Returns:
+        Pagination result distinguishing normal completion from bad checkpoints.
+
+    Side Effects:
+        Posts recent-media requests, appends response text, and writes index
+        checkpoints when pages contain media.
+    """
+
+    cursor = start.cursor
+    page_count = start.page_count
 
     request_template = _recent_page_request_for_rpc_id(
         recent_page_requests,
         rpc_id=cursor.rpc_id,
     )
     if request_template is None:
-        return False
+        return _RecentPaginationResult(
+            completed=False,
+            checkpoint_invalid=start.from_checkpoint,
+        )
 
-    page_count = 0
+    no_progress_pages = 0
+    stats = _recent_payload_stats(capture.response_texts)
+    previous_item_count = stats.item_count
     seen_cursors: set[str] = set()
     while cursor is not None:
         raise_if_interrupt_requested()
@@ -1360,9 +1634,12 @@ async def _page_recent_payloads_to_window(
                 PHASE_LOG_LEVEL,
                 "Recent direct pagination stopped after repeated cursor: pages=%s items=%s",
                 page_count,
-                _recent_payload_item_count(capture.response_texts),
+                stats.item_count,
             )
-            return True
+            return _RecentPaginationResult(
+                completed=not start.from_checkpoint,
+                checkpoint_invalid=start.from_checkpoint,
+            )
         seen_cursors.add(cursor.cursor)
         if request_template.rpc_id != cursor.rpc_id:
             next_template = _recent_page_request_for_rpc_id(
@@ -1370,7 +1647,10 @@ async def _page_recent_payloads_to_window(
                 rpc_id=cursor.rpc_id,
             )
             if next_template is None:
-                return False
+                return _RecentPaginationResult(
+                    completed=False,
+                    checkpoint_invalid=start.from_checkpoint,
+                )
             request_template = next_template
         raw_text = await _fetch_recent_page(
             request_context,
@@ -1380,20 +1660,178 @@ async def _page_recent_payloads_to_window(
         capture.response_texts.append(raw_text)
         page_count += 1
 
-        item_count = _recent_payload_item_count(capture.response_texts)
-        oldest_upload_time = _oldest_recent_upload_time(capture.response_texts)
+        _update_recent_payload_stats(stats, raw_text)
+        if stats.item_count > previous_item_count:
+            previous_item_count = stats.item_count
+            no_progress_pages = 0
+        else:
+            no_progress_pages += 1
         LOGGER.log(
             PHASE_LOG_LEVEL,
             "Recent direct page progress: pages=%s items=%s oldest_upload=%s",
             page_count,
-            item_count,
-            oldest_upload_time.isoformat() if oldest_upload_time is not None else "<unknown>",
+            stats.item_count,
+            (
+                stats.oldest_upload_time.isoformat()
+                if stats.oldest_upload_time is not None
+                else "<unknown>"
+            ),
         )
-        if oldest_upload_time is not None and oldest_upload_time < after:
-            return True
         cursor = _recent_payload_cursor(raw_text)
+        _store_recent_page_checkpoint(
+            state_store,
+            raw_text=raw_text,
+            cursor=cursor,
+            page_count=page_count,
+        )
+        if stats.oldest_upload_time is not None and stats.oldest_upload_time < after:
+            return _RecentPaginationResult(completed=True)
+        if no_progress_pages >= 5:
+            LOGGER.log(
+                PHASE_LOG_LEVEL,
+                "Recent direct pagination stopped after %s no-progress page(s): "
+                "pages=%s items=%s oldest_upload=%s",
+                no_progress_pages,
+                page_count,
+                stats.item_count,
+                (
+                    stats.oldest_upload_time.isoformat()
+                    if stats.oldest_upload_time is not None
+                    else "<unknown>"
+                ),
+            )
+            return _RecentPaginationResult(
+                completed=not start.from_checkpoint,
+                checkpoint_invalid=start.from_checkpoint,
+            )
 
-    return True
+    return _RecentPaginationResult(completed=True)
+
+
+def _store_recent_page_checkpoint(
+    state_store: PullStateStore | None,
+    *,
+    raw_text: str,
+    cursor: _RecentPageCursor | None,
+    page_count: int,
+) -> None:
+    """Description:
+    Store a recent page cursor checkpoint when the page has media items.
+
+    Args:
+        state_store: Optional media index.
+        raw_text: Raw recent-media page response.
+        cursor: Next-page cursor parsed from the response.
+        page_count: One-based direct page count.
+
+    Side Effects:
+        Writes a cursor checkpoint when possible.
+    """
+
+    if state_store is None or cursor is None:
+        return
+    try:
+        payload = parse_recent_payload(raw_text)
+    except RpcPayloadParseError:
+        return
+    _persist_recent_payload_page(state_store, payload)
+    upload_times = [
+        datetime.fromtimestamp(item.upload_timestamp_ms / 1000, tz=UTC)
+        for item in payload.items
+        if item.upload_timestamp_ms is not None
+    ]
+    if not upload_times:
+        return
+    oldest_upload_time = min(upload_times)
+    state_store.advance_upload_coverage(oldest_upload_time)
+    state_store.upsert_recent_page_checkpoint(
+        rpc_id=cursor.rpc_id,
+        cursor=cursor.cursor,
+        oldest_upload_time=oldest_upload_time,
+        item_count=len(payload.items),
+        page_count=page_count,
+    )
+
+
+def _persist_recent_payload_page(state_store: PullStateStore, payload: RecentPayload) -> None:
+    """Description:
+    Persist media rows from one recent-media payload page.
+
+    Args:
+        state_store: Open media index.
+        payload: Parsed recent-media payload.
+
+    Side Effects:
+        Upserts media metadata rows.
+    """
+
+    for item in payload.items:
+        capture_time = (
+            None
+            if item.capture_timestamp_ms is None
+            else datetime.fromtimestamp(item.capture_timestamp_ms / 1000, tz=UTC)
+        )
+        uploaded_time = (
+            None
+            if item.upload_timestamp_ms is None
+            else datetime.fromtimestamp(item.upload_timestamp_ms / 1000, tz=UTC)
+        )
+        state_store.upsert_media(
+            MediaMetadata(
+                media_id=item.media_id,
+                filename=f"unresolved-{item.media_id}",
+                capture_time=capture_time,
+                uploaded_time=uploaded_time,
+                product_url=(
+                    f"{PHOTOS_APP_ORIGIN}/photo/{urllib.parse.quote(item.media_id, safe='')}"
+                ),
+                preview_url=item.preview_url,
+                width=item.width,
+                height=item.height,
+            )
+        )
+
+
+def _recent_payload_stats(response_texts: list[str]) -> _RecentPayloadStats:
+    """Description:
+    Build running statistics from existing recent payload responses.
+
+    Args:
+        response_texts: Raw batchexecute response bodies.
+
+    Returns:
+        Initial recent payload statistics.
+    """
+
+    stats = _RecentPayloadStats(media_ids=set())
+    for raw_text in response_texts:
+        _update_recent_payload_stats(stats, raw_text)
+    return stats
+
+
+def _update_recent_payload_stats(stats: _RecentPayloadStats, raw_text: str) -> None:
+    """Description:
+    Update running recent payload statistics from one response body.
+
+    Args:
+        stats: Mutable running stats.
+        raw_text: Raw batchexecute response body.
+
+    Side Effects:
+        Mutates `stats`.
+    """
+
+    try:
+        payload = parse_recent_payload(raw_text)
+    except RpcPayloadParseError:
+        return
+    for item in payload.items:
+        stats.media_ids.add(item.media_id)
+        if item.upload_timestamp_ms is None:
+            continue
+        upload_time = datetime.fromtimestamp(item.upload_timestamp_ms / 1000, tz=UTC)
+        if stats.oldest_upload_time is None or upload_time < stats.oldest_upload_time:
+            stats.oldest_upload_time = upload_time
 
 
 def _recent_page_request_for_rpc_id(
@@ -1461,18 +1899,20 @@ def _recent_page_form_request(cursor: str, *, rpc_id: str) -> str:
 
     filter_shape = cast(
         JsonValue,
-        json.loads(
-            '["",[[[null,null,null,null,null,null,null,null,null,null,null,null,null,[[[]]]]]]]'
+        msgspec.json.decode(
+            b'["",[[[null,null,null,null,null,null,null,null,null,null,null,null,null,[[[]]]]]]]'
         ),
     )
     inner: list[JsonValue] = [None, None, cursor, None, None, None, 1, filter_shape]
-    outer: list[JsonValue] = [[[rpc_id, json.dumps(inner, separators=(",", ":")), None, "generic"]]]
-    return json.dumps(outer, separators=(",", ":"))
+    outer: list[JsonValue] = [
+        [[rpc_id, msgspec.json.encode(inner).decode(), None, "generic"]]
+    ]
+    return msgspec.json.encode(outer).decode()
 
 
 def _recent_payload_cursor(response_text: str) -> _RecentPageCursor | None:
     """Description:
-    Extract the next-page cursor from a shape-validated recent-media response.
+    Extract the next-page cursor from a recent-media response.
 
     Args:
         response_text: Raw batchexecute response body.
@@ -1481,13 +1921,17 @@ def _recent_payload_cursor(response_text: str) -> _RecentPageCursor | None:
         Opaque cursor plus its RPC id, or `None` when no next page is present.
     """
 
+    recent_rpc_ids: set[str] = set()
     try:
         recent_payload = parse_recent_payload(response_text)
+        recent_rpc_ids = set(recent_payload.rpc_ids)
     except RpcPayloadParseError:
-        return None
-    recent_rpc_ids = set(recent_payload.rpc_ids)
+        pass
+
     for frame in parse_batchexecute_frames(response_text):
-        if frame.rpc_id is None or frame.rpc_id not in recent_rpc_ids:
+        if frame.rpc_id is None:
+            continue
+        if recent_rpc_ids and frame.rpc_id not in recent_rpc_ids:
             continue
         payload = frame.decoded_payload()
         if isinstance(payload, list) and len(payload) > 1 and isinstance(payload[1], str):
@@ -2113,6 +2557,7 @@ async def _start_download_candidate_once_async(
                     record=record,
                     download=download,
                     download_trace=download_trace,
+                    detail_metadata=None,
                     page_url=download_trace.download_url or direct_urls[0],
                 )
             except PlaywrightError as exc:
@@ -2164,11 +2609,20 @@ async def _start_download_candidate_once_async(
 
         if on_stage is not None:
             on_stage("request", metadata, None)
+        detail_capture = _install_detail_response_capture(
+            page,
+            expected_media_id=metadata.media_id,
+        )
         download, download_trace = await _trigger_detail_download_async(
             page,
             slot=slot,
             metadata=metadata,
             photos_ui=photos_ui,
+        )
+        await _flush_response_capture(detail_capture)
+        detail_metadata = parse_detail_metadata(
+            detail_capture.response_texts,
+            expected_media_id=metadata.media_id,
         )
         if on_stage is not None:
             on_stage("download", metadata, download_trace)
@@ -2185,6 +2639,7 @@ async def _start_download_candidate_once_async(
             record=record,
             download=download,
             download_trace=download_trace,
+            detail_metadata=detail_metadata,
             page_url=page.url,
         )
     except PhotosUiError as exc:
@@ -2238,6 +2693,7 @@ def _pending_download_from_started_download_async(
     record: MediaStateRecord,
     download: AsyncDownload,
     download_trace: DownloadTrace,
+    detail_metadata: DetailMetadata | None,
     page_url: str,
 ) -> _PendingDownload:
     """Description:
@@ -2256,6 +2712,7 @@ def _pending_download_from_started_download_async(
         record: Candidate state record.
         download: Started Playwright download.
         download_trace: Observed download network metadata.
+        detail_metadata: Optional parsed detail metadata.
         page_url: Direct or detail URL used to start the download.
 
     Returns:
@@ -2291,6 +2748,7 @@ def _pending_download_from_started_download_async(
         plan=plan,
         download=download,
         download_trace=download_trace,
+        detail_metadata=detail_metadata,
         queued_at=queued_at,
         start_begin_at=start_begin_at,
         download_event_at=download_event_at,
@@ -2396,8 +2854,29 @@ async def _finalize_pending_download_async(
 
     final_metadata = replace(
         pending_download.metadata,
+        filename=final_path.name,
+        product_url=(
+            pending_download.metadata.product_url
+            or (
+                f"{PHOTOS_APP_ORIGIN}/photo/"
+                f"{urllib.parse.quote(pending_download.metadata.media_id, safe='')}"
+            )
+        ),
         bytes_size=final_path.stat().st_size,
     )
+    write_takeout_sidecar(
+        final_path,
+        final_metadata,
+        pending_download.detail_metadata,
+    )
+    detail_metadata = pending_download.detail_metadata
+    if detail_metadata is None:
+        detail_metadata = await _enrich_detail_metadata_after_download_async(
+            pending_download.page,
+            metadata=final_metadata,
+        )
+        if detail_metadata is not None:
+            write_takeout_sidecar(final_path, final_metadata, detail_metadata)
     LOGGER.log(
         TIMING_LOG_LEVEL,
         "timing done slot=%s name=%s finalize=%.2fs total=%.2fs bytes=%s",
@@ -2418,6 +2897,70 @@ async def _finalize_pending_download_async(
     )
     state_store.upsert_media(final_metadata)
     return downloaded_count + 1, failed_count
+
+
+async def _enrich_detail_metadata_after_download_async(
+    page: AsyncPage,
+    *,
+    metadata: MediaMetadata,
+) -> DetailMetadata | None:
+    """Description:
+    Best-effort detail metadata enrichment after media finalization.
+
+    Args:
+        page: Worker page to use for the detail/info panel.
+        metadata: Final media metadata.
+
+    Returns:
+        Parsed detail metadata, or `None` when enrichment fails.
+
+    Side Effects:
+        May navigate the worker page and open the Google Photos info panel.
+    """
+
+    if metadata.product_url is None:
+        return None
+
+    from playwright.async_api import Error as PlaywrightError
+
+    try:
+        capture = _install_detail_response_capture(page, expected_media_id=metadata.media_id)
+        await page.goto(metadata.product_url, wait_until="domcontentloaded")
+        with suppress(PlaywrightError):
+            await page.get_by_label("Info").first.click(timeout=2_000)
+        await _wait_for_capture_count(capture, previous_count=0, timeout_seconds=2.0)
+        await _flush_response_capture(capture)
+    except Exception:
+        return None
+    return parse_detail_metadata(capture.response_texts, expected_media_id=metadata.media_id)
+
+
+def _install_detail_response_capture(
+    page: AsyncPage,
+    *,
+    expected_media_id: str,
+) -> _AsyncResponseCapture:
+    """Description:
+    Capture item-specific detail/info batchexecute responses.
+
+    Args:
+        page: Page to observe.
+        expected_media_id: Media id required by the detail parser.
+
+    Returns:
+        Response capture state.
+
+    Side Effects:
+        Registers a Playwright response listener.
+    """
+
+    def parse_or_raise(raw_text: str) -> DetailMetadata:
+        detail = parse_detail_metadata([raw_text], expected_media_id=expected_media_id)
+        if detail is None:
+            raise RpcPayloadParseError("No matching detail metadata.")
+        return detail
+
+    return _install_batchexecute_capture_async(page, parse_or_raise)
 
 
 def _download_item_log_line(metadata: MediaMetadata, *, expected_bytes: int | None) -> str:
@@ -3221,23 +3764,21 @@ def _write_download_trace_artifact(
     """
 
     directory.mkdir(parents=True, exist_ok=True)
-    payload = {
-        "media_id": media_id,
-        "filename": filename,
-        "product_url": product_url,
-        "page_url": page_url,
-        "download_trace": {
-            "download_url": trace.download_url,
-            "final_url": trace.final_url,
-            "content_type": trace.content_type,
-            "content_length": trace.content_length,
-            "content_disposition": trace.content_disposition,
-        },
-    }
-    (directory / f"{media_id}.json").write_text(
-        json.dumps(payload, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
+    payload = _DownloadTraceArtifact(
+        media_id=media_id,
+        filename=filename,
+        product_url=product_url,
+        page_url=page_url,
+        download_trace=_DownloadTraceJson(
+            download_url=trace.download_url,
+            final_url=trace.final_url,
+            content_type=trace.content_type,
+            content_length=trace.content_length,
+            content_disposition=trace.content_disposition,
+        ),
     )
+    encoded = msgspec.json.encode(payload)
+    (directory / f"{media_id}.json").write_bytes(msgspec.json.format(encoded, indent=2) + b"\n")
 
 
 async def _install_preview_media_blocker_async(

@@ -105,8 +105,8 @@ def cooperative_sigint_handling() -> Iterator[None]:
     Install a temporary SIGINT handler for graceful pull cancellation.
 
     Returns:
-        A context manager that sets an interrupt flag on first Ctrl-C and delegates
-        to the previous/default handler on repeated Ctrl-C.
+        A context manager that sets an interrupt flag on Ctrl-C and lets
+        cooperative callers perform cleanup.
 
     Side Effects:
         Temporarily replaces the process SIGINT handler and resets local interrupt
@@ -118,7 +118,7 @@ def cooperative_sigint_handling() -> Iterator[None]:
 
     def handler(signum: int, frame: FrameType | None) -> None:
         """Description:
-        Record Ctrl-C once and delegate repeated interrupts to the previous handler.
+        Record Ctrl-C and notify cooperative cancellation callbacks.
 
         Args:
             signum: Signal number.
@@ -128,16 +128,12 @@ def cooperative_sigint_handling() -> Iterator[None]:
             Mutates interrupt state and may invoke the previous/default handler.
         """
 
+        del signum, frame
         _STATE.requested = True
         _STATE.count += 1
         for callback in tuple(_CALLBACKS):
             with suppress(Exception):
                 callback()
-        if _STATE.count >= 2:
-            if callable(previous_handler):
-                previous_handler(signum, frame)
-                return
-            signal.default_int_handler(signum, frame)
 
     signal.signal(signal.SIGINT, handler)
     try:

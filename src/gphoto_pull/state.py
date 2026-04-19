@@ -8,7 +8,7 @@ Description:
 from __future__ import annotations
 
 import sqlite3
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from types import TracebackType
@@ -16,6 +16,7 @@ from types import TracebackType
 from gphoto_pull.models import MediaMetadata, MediaStateRecord, SyncCheckpoint
 
 DEFAULT_STATE_DB_PATH = Path(".state/pull-state.sqlite3")
+UPLOAD_COVERAGE_CHECKPOINT = "recent-upload-indexed-through"
 
 
 def _require_datetime(value: datetime | None, *, field_name: str) -> datetime:
@@ -33,6 +34,30 @@ def _require_datetime(value: datetime | None, *, field_name: str) -> datetime:
     if value is None:
         raise ValueError(f"{field_name} is missing from persisted state.")
     return value
+
+
+@dataclass(slots=True, frozen=True)
+class RecentPageCheckpoint:
+    """Stored recent-media cursor checkpoint.
+
+    Description:
+        Represents a safe place to resume older upload-time pagination.
+
+    Attributes:
+        rpc_id: Opaque browser RPC id that produced the cursor.
+        cursor: Opaque cursor for the next older page.
+        oldest_upload_time: Oldest upload timestamp seen before this cursor.
+        item_count: Number of media items in the page that produced this cursor.
+        page_count: One-based direct page count observed in the refresh run.
+        created_at: Time this checkpoint was stored.
+    """
+
+    rpc_id: str
+    cursor: str
+    oldest_upload_time: datetime
+    item_count: int
+    page_count: int
+    created_at: datetime
 
 
 class PullStateStore:
@@ -137,6 +162,15 @@ class PullStateStore:
                     value TEXT,
                     updated_at TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS recent_page_checkpoints (
+                    cursor TEXT PRIMARY KEY,
+                    rpc_id TEXT NOT NULL,
+                    oldest_upload_time TEXT NOT NULL,
+                    item_count INTEGER NOT NULL,
+                    page_count INTEGER NOT NULL,
+                    created_at TEXT NOT NULL
+                );
                 """
             )
             self._ensure_media_state_schema()
@@ -144,6 +178,12 @@ class PullStateStore:
                 """
                 CREATE INDEX IF NOT EXISTS idx_media_state_uploaded_time
                     ON media_state (uploaded_time DESC, media_id)
+                """
+            )
+            self._connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_recent_page_checkpoints_oldest
+                    ON recent_page_checkpoints (oldest_upload_time ASC, rpc_id)
                 """
             )
 
@@ -294,6 +334,182 @@ class PullStateStore:
 
         rows = self._connection.execute(query, parameters).fetchall()
         return [self._row_to_media_record(row) for row in rows]
+
+    def list_media_in_upload_window(
+        self,
+        *,
+        after: datetime,
+        before: datetime | None,
+    ) -> list[MediaStateRecord]:
+        """Description:
+        List indexed media whose upload timestamp is inside a requested window.
+
+        Args:
+            after: Inclusive lower-bound timestamp.
+            before: Optional exclusive upper-bound timestamp.
+
+        Returns:
+            Matching media records ordered by upload time descending.
+        """
+
+        records = self.list_media()
+        return [
+            record
+            for record in records
+            if record.metadata.uploaded_time is not None
+            and record.metadata.uploaded_time >= after
+            and not (before is not None and record.metadata.uploaded_time >= before)
+        ]
+
+    def upload_coverage_satisfies(self, after: datetime) -> bool:
+        """Description:
+        Check whether the rolling index covers the requested lower bound.
+
+        Args:
+            after: Inclusive lower-bound timestamp requested by the caller.
+
+        Returns:
+            `True` when the index is known complete from newest through `after`.
+        """
+
+        checkpoint = self.get_checkpoint(UPLOAD_COVERAGE_CHECKPOINT)
+        if checkpoint is None or checkpoint.value is None:
+            return False
+        covered_after = datetime.fromisoformat(checkpoint.value)
+        return covered_after <= after.astimezone(UTC)
+
+    def advance_upload_coverage(self, oldest_upload_time: datetime) -> SyncCheckpoint:
+        """Description:
+        Advance the rolling upload coverage checkpoint.
+
+        Args:
+            oldest_upload_time: Oldest upload timestamp durably indexed so far.
+
+        Returns:
+            Persisted rolling coverage checkpoint.
+
+        Side Effects:
+            Writes a checkpoint row after successful page/index commits.
+        """
+
+        normalized_after = oldest_upload_time.astimezone(UTC)
+        checkpoint = self.get_checkpoint(UPLOAD_COVERAGE_CHECKPOINT)
+        if checkpoint is not None and checkpoint.value is not None:
+            existing_after = datetime.fromisoformat(checkpoint.value)
+            if existing_after <= normalized_after:
+                return checkpoint
+        return self.set_checkpoint(UPLOAD_COVERAGE_CHECKPOINT, normalized_after.isoformat())
+
+    def upsert_recent_page_checkpoint(
+        self,
+        *,
+        rpc_id: str,
+        cursor: str,
+        oldest_upload_time: datetime,
+        item_count: int,
+        page_count: int,
+    ) -> RecentPageCheckpoint:
+        """Description:
+        Store a recent-media cursor checkpoint.
+
+        Args:
+            rpc_id: Opaque RPC id used for the page request.
+            cursor: Opaque cursor for the next older page.
+            oldest_upload_time: Oldest upload timestamp in the page that yielded
+                this cursor.
+            item_count: Number of media items in that page.
+            page_count: One-based direct page count observed in the refresh run.
+
+        Returns:
+            Persisted checkpoint.
+
+        Side Effects:
+            Writes one checkpoint row.
+        """
+
+        if item_count <= 0:
+            raise ValueError("item_count must be greater than zero.")
+        if page_count <= 0:
+            raise ValueError("page_count must be greater than zero.")
+
+        checkpoint = RecentPageCheckpoint(
+            rpc_id=rpc_id,
+            cursor=cursor,
+            oldest_upload_time=oldest_upload_time.astimezone(UTC),
+            item_count=item_count,
+            page_count=page_count,
+            created_at=datetime.now(UTC),
+        )
+        with self._connection:
+            self._connection.execute(
+                """
+                INSERT INTO recent_page_checkpoints (
+                    cursor,
+                    rpc_id,
+                    oldest_upload_time,
+                    item_count,
+                    page_count,
+                    created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(cursor) DO UPDATE SET
+                    rpc_id = excluded.rpc_id,
+                    oldest_upload_time = excluded.oldest_upload_time,
+                    item_count = excluded.item_count,
+                    page_count = excluded.page_count,
+                    created_at = excluded.created_at
+                """,
+                (
+                    checkpoint.cursor,
+                    checkpoint.rpc_id,
+                    checkpoint.oldest_upload_time.isoformat(),
+                    checkpoint.item_count,
+                    checkpoint.page_count,
+                    checkpoint.created_at.isoformat(),
+                ),
+            )
+        return checkpoint
+
+    def best_recent_page_checkpoint(
+        self,
+        *,
+        after: datetime,
+        rpc_ids: tuple[str, ...],
+    ) -> RecentPageCheckpoint | None:
+        """Description:
+        Find the nearest stored cursor that can extend coverage to `after`.
+
+        Args:
+            after: Requested lower-bound timestamp.
+            rpc_ids: Current browser-captured RPC ids that are safe to replay.
+
+        Returns:
+            Checkpoint closest to `after`, or `None`.
+        """
+
+        if not rpc_ids:
+            return None
+        placeholders = ", ".join("?" for _ in rpc_ids)
+        rows = self._connection.execute(
+            f"""
+            SELECT
+                cursor,
+                rpc_id,
+                oldest_upload_time,
+                item_count,
+                page_count,
+                created_at
+            FROM recent_page_checkpoints
+            WHERE oldest_upload_time >= ?
+              AND rpc_id IN ({placeholders})
+            ORDER BY oldest_upload_time ASC
+            LIMIT 1
+            """,
+            (after.astimezone(UTC).isoformat(), *rpc_ids),
+        ).fetchall()
+        if not rows:
+            return None
+        return _row_to_recent_page_checkpoint(rows[0])
 
     def set_checkpoint(self, name: str, value: str | None) -> SyncCheckpoint:
         """Description:
@@ -476,3 +692,24 @@ class PullStateStore:
                 field_name="last_seen_at",
             ),
         )
+
+
+def _row_to_recent_page_checkpoint(row: sqlite3.Row) -> RecentPageCheckpoint:
+    """Description:
+    Convert a SQLite row into a recent page checkpoint.
+
+    Args:
+        row: SQLite row from `recent_page_checkpoints`.
+
+    Returns:
+        Decoded checkpoint.
+    """
+
+    return RecentPageCheckpoint(
+        rpc_id=str(row["rpc_id"]),
+        cursor=str(row["cursor"]),
+        oldest_upload_time=datetime.fromisoformat(str(row["oldest_upload_time"])),
+        item_count=int(row["item_count"]),
+        page_count=int(row["page_count"]),
+        created_at=datetime.fromisoformat(str(row["created_at"])),
+    )
