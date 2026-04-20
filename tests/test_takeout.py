@@ -4,6 +4,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 import msgspec.json
+
 from gphoto_pull.detail_payloads import DetailMetadata, GeoData
 from gphoto_pull.models import MediaMetadata
 from gphoto_pull.takeout import TakeoutSidecar, write_takeout_sidecar
@@ -23,15 +24,20 @@ class TakeoutSidecarTests(unittest.TestCase):
             )
 
             sidecar_path = write_takeout_sidecar(media_path, metadata)
+            contents = sidecar_path.read_text(encoding="utf-8")
             payload = msgspec.json.decode(sidecar_path.read_bytes(), type=TakeoutSidecar)
 
             self.assertEqual(sidecar_path.name, "IMG_0001.JPG.supplemental-metadata.json")
+            self.assertIn('"imageViews"', contents)
+            self.assertIn('"creationTime"', contents)
+            self.assertNotIn('"image_views"', contents)
+            self.assertNotIn('"geoData"', contents)
             self.assertEqual(payload.title, "IMG_0001.JPG")
             self.assertEqual(payload.description, "")
-            self.assertEqual(payload.imageViews, "0")
-            self.assertEqual(payload.creationTime.timestamp, "1776560523")
-            self.assertEqual(payload.photoTakenTime.timestamp, "1776515696")
-            self.assertIsNone(payload.geoData)
+            self.assertEqual(payload.image_views, "0")
+            self.assertEqual(payload.creation_time.timestamp, "1776560523")
+            self.assertEqual(payload.photo_taken_time.timestamp, "1776515696")
+            self.assertIsNone(payload.geo_data)
             self.assertEqual(payload.url, "https://photos.google.com/photo/media-1")
 
     def test_write_takeout_sidecar_matches_final_collision_filename(self) -> None:
@@ -71,13 +77,16 @@ class TakeoutSidecarTests(unittest.TestCase):
             )
 
             sidecar_path = write_takeout_sidecar(media_path, metadata, detail)
+            contents = sidecar_path.read_text(encoding="utf-8")
             payload = msgspec.json.decode(sidecar_path.read_bytes(), type=TakeoutSidecar)
 
+            self.assertIn('"geoData"', contents)
+            self.assertIn('"latitudeSpan"', contents)
             self.assertEqual(payload.description, "caption")
-            self.assertIsNotNone(payload.geoData)
-            assert payload.geoData is not None
-            self.assertEqual(payload.geoData.latitude, 37.6313)
-            self.assertEqual(payload.geoData.longitude, -122.4491)
+            self.assertIsNotNone(payload.geo_data)
+            assert payload.geo_data is not None
+            self.assertEqual(payload.geo_data.latitude, 37.6313)
+            self.assertEqual(payload.geo_data.longitude, -122.4491)
             self.assertEqual(tuple(person.name for person in payload.people), ("Gideon",))
 
 

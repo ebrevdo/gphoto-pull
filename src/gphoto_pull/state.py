@@ -36,6 +36,55 @@ def _require_datetime(value: datetime | None, *, field_name: str) -> datetime:
     return value
 
 
+def _merge_media_metadata(existing: MediaMetadata, incoming: MediaMetadata) -> MediaMetadata:
+    """Description:
+    Merge a new discovery row into existing media metadata without losing richer fields.
+
+    Args:
+        existing: Current persisted metadata.
+        incoming: Newly discovered metadata for the same media id.
+
+    Returns:
+        Merged metadata preserving known filenames and optional fields unless the
+        incoming row provides better information.
+    """
+
+    return MediaMetadata(
+        media_id=existing.media_id,
+        filename=_merge_filename(existing.filename, incoming.filename, media_id=existing.media_id),
+        capture_time=incoming.capture_time or existing.capture_time,
+        uploaded_time=incoming.uploaded_time or existing.uploaded_time,
+        mime_type=incoming.mime_type or existing.mime_type,
+        media_type=incoming.media_type or existing.media_type,
+        product_url=incoming.product_url or existing.product_url,
+        preview_url=incoming.preview_url or existing.preview_url,
+        width=incoming.width or existing.width,
+        height=incoming.height or existing.height,
+        bytes_size=incoming.bytes_size if incoming.bytes_size is not None else existing.bytes_size,
+    )
+
+
+def _merge_filename(existing: str, incoming: str, *, media_id: str) -> str:
+    """Description:
+    Prefer resolved filenames over unresolved placeholder filenames.
+
+    Args:
+        existing: Current persisted filename.
+        incoming: Newly discovered filename.
+        media_id: Media id used to recognize unresolved placeholders.
+
+    Returns:
+        Filename to persist.
+    """
+
+    unresolved = f"unresolved-{media_id}"
+    if existing == unresolved and incoming != unresolved:
+        return incoming
+    if incoming == unresolved:
+        return existing
+    return incoming
+
+
 @dataclass(slots=True, frozen=True)
 class RecentPageCheckpoint:
     """Stored recent-media cursor checkpoint.
@@ -252,7 +301,7 @@ class PullStateStore:
         else:
             record = replace(
                 existing,
-                metadata=metadata,
+                metadata=_merge_media_metadata(existing.metadata, metadata),
                 last_seen_at=now,
             )
 

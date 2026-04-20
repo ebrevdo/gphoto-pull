@@ -393,8 +393,8 @@ def recent_row_limit(*, console_height: int, active_rows: int) -> int:
         Recent-completion row budget.
     """
 
-    fixed_rows = 12
-    return max(3, min(50, console_height - active_rows - fixed_rows))
+    fixed_rows = 14
+    return max(0, min(50, console_height - active_rows - fixed_rows))
 
 
 def _parse_item_status(*, slot: int, status: str, detail: str) -> PullItemStatus:
@@ -456,6 +456,10 @@ def _styled_status(status: str) -> Text:
         "request": "cyan",
         "download": "bright_blue",
         "finalize": "blue",
+        "enrich": "bright_cyan",
+        "enriched": "green",
+        "enrich-miss": "yellow",
+        "enrich-failed": "red",
         "done": "green",
         "failed": "red",
     }

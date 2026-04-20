@@ -4,6 +4,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 import msgspec.json
+
 from gphoto_pull.enumeration import enumerate_saved_candidates
 from gphoto_pull.photos_ui import PhotosSurface, extract_photo_locations_from_html
 from gphoto_pull.rpc_payloads import JsonValue

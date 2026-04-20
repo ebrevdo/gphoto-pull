@@ -41,6 +41,7 @@ from gphoto_pull.download import (
     create_staging_path,
     finalize_download,
     plan_download_target,
+    primary_download_path,
 )
 from gphoto_pull.enumeration import (
     EnumerationSummary,
@@ -95,6 +96,7 @@ PHASE_LOG_LEVEL = logging.INFO
 TIMING_LOG_LEVEL = logging.DEBUG
 
 LOGIN_START_URL = default_login_start_url()
+DETAIL_METADATA_ENRICHMENT_TIMEOUT_SECONDS = 15.0
 
 
 @dataclass(slots=True)
@@ -200,6 +202,25 @@ class _PendingDownload:
     download_event_at: float
 
 
+@dataclass(slots=True, frozen=True)
+class _EnrichmentJob:
+    """Post-download metadata enrichment job.
+
+    Description:
+        Carries the finalized media path and metadata needed to rewrite a
+        Takeout-style sidecar with Google Photos detail metadata.
+
+    Attributes:
+        media_path: Final downloaded media path.
+        metadata: Final metadata written with the minimal sidecar.
+        queued_at: Monotonic timestamp when enrichment was queued.
+    """
+
+    media_path: Path
+    metadata: MediaMetadata
+    queued_at: float
+
+
 @dataclass(slots=True)
 class _AsyncResponseCapture:
     """Async response capture state.
@@ -212,11 +233,15 @@ class _AsyncResponseCapture:
         response_texts: Unique response bodies accepted by the parser.
         tasks: Pending response-processing tasks.
         accepted_event: Event set when a new unique response body is accepted.
+        page: Page whose response listener was registered.
+        response_handler: Registered response listener.
     """
 
     response_texts: list[str]
     tasks: set[asyncio.Task[None]]
     accepted_event: asyncio.Event
+    page: AsyncPage
+    response_handler: Callable[[AsyncResponse], None]
 
 
 @dataclass(slots=True, frozen=True)
@@ -483,6 +508,8 @@ class GooglePhotosPuller:
             f"Login/session strategy: {strategy_detail}",
             f"Headless browser for pull: {self.config.headless}",
             f"Download concurrency: {self.config.download_concurrency}",
+            f"Metadata enrichment concurrency: {self.config.enrichment_concurrency}",
+            f"Post-download metadata enrichment: {self.config.enrich_metadata}",
         ]
         lines.extend(self.photos_ui.dry_run_notes(diagnostics_dir=self.config.diagnostics_dir))
         lines.extend(_artifact_summary_lines(self.config.diagnostics_dir))
@@ -538,6 +565,8 @@ class GooglePhotosPuller:
             f"Diagnostics directory: {self.config.diagnostics_dir}",
             f"Sync DB path: {self.config.sync_db_path}",
             f"Download concurrency: {self.config.download_concurrency}",
+            f"Metadata enrichment concurrency: {self.config.enrichment_concurrency}",
+            f"Post-download metadata enrichment: {self.config.enrich_metadata}",
         ]
         paths = BrowserSessionPaths(
             download_dir=self.config.download_dir,
@@ -782,10 +811,18 @@ class GooglePhotosPuller:
             len(queue),
         )
         lines.append(f"Download workers: {download_concurrency} async download workers")
+        enrichment_concurrency = (
+            _bounded_download_concurrency(self.config.enrichment_concurrency, len(queue))
+            if self.config.enrich_metadata
+            else 0
+        )
+        if enrichment_concurrency:
+            lines.append(f"Metadata enrichment workers: {enrichment_concurrency} async workers")
         LOGGER.log(
             PHASE_LOG_LEVEL,
-            "Starting downloads with %s worker(s).",
+            "Starting downloads with %s worker(s), enrichment workers=%s.",
             download_concurrency,
+            enrichment_concurrency,
         )
         execution = await _download_candidates_async(
             context,
@@ -795,6 +832,8 @@ class GooglePhotosPuller:
             photos_ui=self.photos_ui,
             queued_candidates=queue,
             download_concurrency=download_concurrency,
+            enrichment_concurrency=enrichment_concurrency,
+            enrich_metadata=self.config.enrich_metadata,
             progress_interactive=self.config.progress_interactive,
         )
         return replace(execution, skipped_existing_count=skipped_existing_count)
@@ -1170,111 +1209,123 @@ async def _capture_recent_probe_async(
     from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
     try:
-        raise_if_interrupt_requested()
-        await page.goto(RECENTLY_ADDED_URL, wait_until="domcontentloaded")
-        with suppress(PlaywrightTimeoutError):
-            await photos_ui.wait_for_recently_added_async(page, timeout_ms=5_000)
-        await _wait_for_capture_or_visible_recent(
-            capture,
-            photos_ui=photos_ui,
+        try:
+            raise_if_interrupt_requested()
+            await page.goto(RECENTLY_ADDED_URL, wait_until="domcontentloaded")
+            with suppress(PlaywrightTimeoutError):
+                await photos_ui.wait_for_recently_added_async(page, timeout_ms=10_000)
+            await _wait_for_capture_or_visible_recent(
+                capture,
+                photos_ui=photos_ui,
+                page=page,
+                previous_payload_count=0,
+                previous_visible_count=0,
+                timeout_seconds=2.0,
+            )
+        except PlaywrightError as exc:
+            if interrupt_requested():
+                raise KeyboardInterrupt from exc
+            raise BrowserSessionError(f"Failed to open Recently added: {exc}") from exc
+
+        location = classify_photos_url(page.url)
+        if location.surface is not PhotosSurface.SEARCH_RESULTS:
+            await _write_failure_artifacts_async(
+                page,
+                diagnostics_dir / "pull_failures",
+                "recent-auth-failure",
+            )
+            raise BrowserSessionError(
+                "Persistent browser profile did not reach the authenticated Recently added route. "
+                f"Current URL: {page.url}. Rerun `gphoto-pull login`."
+            )
+
+        stable_iterations = 0
+        scroll_iterations = 0
+        previous_payload_count = _recent_payload_item_count(capture.response_texts)
+        previous_visible_count = await photos_ui.visible_recent_media_count_async(page)
+        while True:
+            raise_if_interrupt_requested()
+            oldest_upload_time = _oldest_recent_upload_time(capture.response_texts)
+            if oldest_upload_time is not None and oldest_upload_time < after:
+                LOGGER.log(
+                    PHASE_LOG_LEVEL,
+                    "Recent probe reached requested window: items=%s oldest_upload=%s",
+                    previous_payload_count,
+                    oldest_upload_time.isoformat(),
+                )
+                break
+
+            if await _page_recent_payloads_to_window(
+                page.context.request,
+                capture,
+                recent_page_requests,
+                after=after,
+                state_store=state_store,
+            ):
+                break
+
+            scrolled = await photos_ui.scroll_recently_added_container_async(page)
+            scroll_iterations += 1
+            await _wait_for_capture_or_visible_recent(
+                capture,
+                photos_ui=photos_ui,
+                page=page,
+                previous_payload_count=previous_payload_count,
+                previous_visible_count=previous_visible_count,
+                timeout_seconds=1.5,
+            )
+            payload_count = _recent_payload_item_count(capture.response_texts)
+            visible_count = await photos_ui.visible_recent_media_count_async(page)
+            oldest_upload_time = _oldest_recent_upload_time(capture.response_texts)
+
+            if payload_count > previous_payload_count or visible_count > previous_visible_count:
+                previous_payload_count = payload_count
+                previous_visible_count = visible_count
+                stable_iterations = 0
+            elif not scrolled:
+                stable_iterations += 1
+            else:
+                stable_iterations += 1
+
+            if stable_iterations >= 2 and (payload_count > 0 or visible_count > 0):
+                LOGGER.log(
+                    PHASE_LOG_LEVEL,
+                    "Recent probe stopped after feed stopped advancing: items=%s oldest_upload=%s",
+                    payload_count,
+                    (
+                        oldest_upload_time.isoformat()
+                        if oldest_upload_time is not None
+                        else "<unknown>"
+                    ),
+                )
+                break
+
+            if scroll_iterations % 25 == 0:
+                LOGGER.log(
+                    PHASE_LOG_LEVEL,
+                    "Recent probe scroll progress: scrolls=%s items=%s oldest_upload=%s",
+                    scroll_iterations,
+                    payload_count,
+                    (
+                        oldest_upload_time.isoformat()
+                        if oldest_upload_time is not None
+                        else "<unknown>"
+                    ),
+                )
+
+        await _flush_response_capture(capture)
+        _persist_recent_payloads_from_responses(state_store, capture.response_texts)
+        _reset_capture_dir(target_dir)
+        await _write_probe_artifacts_async(
             page=page,
-            previous_payload_count=0,
-            previous_visible_count=0,
-            timeout_seconds=2.0,
+            target_dir=target_dir,
+            html_name="recent.html",
+            screenshot_name="recent.png",
+            response_texts=capture.response_texts,
         )
-    except PlaywrightError as exc:
-        if interrupt_requested():
-            raise KeyboardInterrupt from exc
-        raise BrowserSessionError(f"Failed to open Recently added: {exc}") from exc
-
-    location = classify_photos_url(page.url)
-    if location.surface is not PhotosSurface.SEARCH_RESULTS:
-        await _write_failure_artifacts_async(
-            page,
-            diagnostics_dir / "pull_failures",
-            "recent-auth-failure",
-        )
-        raise BrowserSessionError(
-            "Persistent browser profile did not reach the authenticated Recently added route. "
-            f"Current URL: {page.url}. Rerun `gphoto-pull login`."
-        )
-
-    stable_iterations = 0
-    scroll_iterations = 0
-    previous_payload_count = _recent_payload_item_count(capture.response_texts)
-    previous_visible_count = await photos_ui.visible_recent_media_count_async(page)
-    while True:
-        raise_if_interrupt_requested()
-        oldest_upload_time = _oldest_recent_upload_time(capture.response_texts)
-        if oldest_upload_time is not None and oldest_upload_time < after:
-            LOGGER.log(
-                PHASE_LOG_LEVEL,
-                "Recent probe reached requested window: items=%s oldest_upload=%s",
-                previous_payload_count,
-                oldest_upload_time.isoformat(),
-            )
-            break
-
-        if await _page_recent_payloads_to_window(
-            page.context.request,
-            capture,
-            recent_page_requests,
-            after=after,
-            state_store=state_store,
-        ):
-            break
-
-        scrolled = await photos_ui.scroll_recently_added_container_async(page)
-        scroll_iterations += 1
-        await _wait_for_capture_or_visible_recent(
-            capture,
-            photos_ui=photos_ui,
-            page=page,
-            previous_payload_count=previous_payload_count,
-            previous_visible_count=previous_visible_count,
-            timeout_seconds=1.5,
-        )
-        payload_count = _recent_payload_item_count(capture.response_texts)
-        visible_count = await photos_ui.visible_recent_media_count_async(page)
-        oldest_upload_time = _oldest_recent_upload_time(capture.response_texts)
-
-        if payload_count > previous_payload_count or visible_count > previous_visible_count:
-            previous_payload_count = payload_count
-            previous_visible_count = visible_count
-            stable_iterations = 0
-        elif not scrolled:
-            stable_iterations += 1
-        else:
-            stable_iterations += 1
-
-        if stable_iterations >= 2 and (payload_count > 0 or visible_count > 0):
-            LOGGER.log(
-                PHASE_LOG_LEVEL,
-                "Recent probe stopped after feed stopped advancing: items=%s oldest_upload=%s",
-                payload_count,
-                oldest_upload_time.isoformat() if oldest_upload_time is not None else "<unknown>",
-            )
-            break
-
-        if scroll_iterations % 25 == 0:
-            LOGGER.log(
-                PHASE_LOG_LEVEL,
-                "Recent probe scroll progress: scrolls=%s items=%s oldest_upload=%s",
-                scroll_iterations,
-                payload_count,
-                oldest_upload_time.isoformat() if oldest_upload_time is not None else "<unknown>",
-            )
-
-    await _flush_response_capture(capture)
-    _reset_capture_dir(target_dir)
-    await _write_probe_artifacts_async(
-        page=page,
-        target_dir=target_dir,
-        html_name="recent.html",
-        screenshot_name="recent.png",
-        response_texts=capture.response_texts,
-    )
-    return len(capture.response_texts)
+        return len(capture.response_texts)
+    finally:
+        await _close_response_capture(capture)
 
 
 async def _capture_updates_probe_async(
@@ -1302,43 +1353,46 @@ async def _capture_updates_probe_async(
     from playwright.async_api import Error as PlaywrightError
 
     try:
-        raise_if_interrupt_requested()
-        await page.goto(UPDATES_URL, wait_until="domcontentloaded")
-        await _wait_for_capture_count(capture, previous_count=0, timeout_seconds=2.0)
-    except PlaywrightError as exc:
-        if interrupt_requested():
-            raise KeyboardInterrupt from exc
-        raise BrowserSessionError(f"Failed to open Updates: {exc}") from exc
+        try:
+            raise_if_interrupt_requested()
+            await page.goto(UPDATES_URL, wait_until="domcontentloaded")
+            await _wait_for_capture_count(capture, previous_count=0, timeout_seconds=2.0)
+        except PlaywrightError as exc:
+            if interrupt_requested():
+                raise KeyboardInterrupt from exc
+            raise BrowserSessionError(f"Failed to open Updates: {exc}") from exc
 
-    location = classify_photos_url(page.url)
-    if location.surface is not PhotosSurface.UPDATES:
-        await _write_failure_artifacts_async(
-            page,
-            diagnostics_dir / "pull_failures",
-            "updates-auth-failure",
+        location = classify_photos_url(page.url)
+        if location.surface is not PhotosSurface.UPDATES:
+            await _write_failure_artifacts_async(
+                page,
+                diagnostics_dir / "pull_failures",
+                "updates-auth-failure",
+            )
+            raise BrowserSessionError(
+                "Persistent browser profile did not reach the authenticated Updates route. "
+                f"Current URL: {page.url}. Rerun `gphoto-pull login`."
+            )
+
+        await _flush_response_capture(capture)
+        _reset_capture_dir(target_dir)
+        await _write_probe_artifacts_async(
+            page=page,
+            target_dir=target_dir,
+            html_name="updates.html",
+            screenshot_name="updates.png",
+            response_texts=capture.response_texts,
         )
-        raise BrowserSessionError(
-            "Persistent browser profile did not reach the authenticated Updates route. "
-            f"Current URL: {page.url}. Rerun `gphoto-pull login`."
-        )
 
-    await _flush_response_capture(capture)
-    _reset_capture_dir(target_dir)
-    await _write_probe_artifacts_async(
-        page=page,
-        target_dir=target_dir,
-        html_name="updates.html",
-        screenshot_name="updates.png",
-        response_texts=capture.response_texts,
-    )
+        neutral_artifact = diagnostics_dir / "updates-batchexecute.txt"
+        if capture.response_texts:
+            neutral_artifact.write_text(capture.response_texts[-1], encoding="utf-8")
+        elif neutral_artifact.exists():
+            neutral_artifact.unlink()
 
-    neutral_artifact = diagnostics_dir / "updates-batchexecute.txt"
-    if capture.response_texts:
-        neutral_artifact.write_text(capture.response_texts[-1], encoding="utf-8")
-    elif neutral_artifact.exists():
-        neutral_artifact.unlink()
-
-    return len(capture.response_texts)
+        return len(capture.response_texts)
+    finally:
+        await _close_response_capture(capture)
 
 
 def _install_batchexecute_capture_async(
@@ -1383,13 +1437,21 @@ def _install_batchexecute_capture_async(
             )
         )
         tasks.add(task)
-        task.add_done_callback(tasks.discard)
+
+        def on_task_done(done_task: asyncio.Task[None]) -> None:
+            tasks.discard(done_task)
+            with suppress(asyncio.CancelledError, Exception):
+                done_task.exception()
+
+        task.add_done_callback(on_task_done)
 
     page.on("response", on_response)
     return _AsyncResponseCapture(
         response_texts=response_texts,
         tasks=tasks,
         accepted_event=capture_event,
+        page=page,
+        response_handler=on_response,
     )
 
 
@@ -1487,6 +1549,32 @@ async def _flush_response_capture(capture: _AsyncResponseCapture) -> None:
         finally:
             for task in tasks:
                 capture.tasks.discard(task)
+
+
+async def _close_response_capture(
+    capture: _AsyncResponseCapture,
+    *,
+    drain: bool = True,
+) -> None:
+    """Description:
+    Remove a response capture listener and optionally finish pending tasks.
+
+    Args:
+        capture: Capture state returned by `_install_batchexecute_capture_async`.
+        drain: Whether to wait for pending response-body parsing tasks.
+
+    Side Effects:
+        Unregisters the page response listener. When `drain` is false, cancels
+        pending capture tasks without awaiting potentially stuck response-body
+        reads.
+    """
+
+    capture.page.remove_listener("response", capture.response_handler)
+    if drain:
+        await _flush_response_capture(capture)
+        return
+    for task in tuple(capture.tasks):
+        task.cancel()
 
 
 async def _page_recent_payloads_to_window(
@@ -1751,6 +1839,40 @@ def _store_recent_page_checkpoint(
         item_count=len(payload.items),
         page_count=page_count,
     )
+
+
+def _persist_recent_payloads_from_responses(
+    state_store: PullStateStore | None,
+    response_texts: list[str],
+) -> None:
+    """Description:
+    Persist media rows from captured recent-media response bodies.
+
+    Args:
+        state_store: Optional media index.
+        response_texts: Raw recent-media response bodies.
+
+    Side Effects:
+        Upserts media rows and advances upload coverage when timestamps exist.
+    """
+
+    if state_store is None:
+        return
+
+    upload_times: list[datetime] = []
+    for raw_text in response_texts:
+        try:
+            payload = parse_recent_payload(raw_text)
+        except RpcPayloadParseError:
+            continue
+        _persist_recent_payload_page(state_store, payload)
+        upload_times.extend(
+            datetime.fromtimestamp(item.upload_timestamp_ms / 1000, tz=UTC)
+            for item in payload.items
+            if item.upload_timestamp_ms is not None
+        )
+    if upload_times:
+        state_store.advance_upload_coverage(min(upload_times))
 
 
 def _persist_recent_payload_page(state_store: PullStateStore, payload: RecentPayload) -> None:
@@ -2187,11 +2309,16 @@ def _target_path_exists(record: MediaStateRecord, *, download_dir: Path) -> bool
         `True` when the final planned path exists.
     """
 
-    try:
-        plan = plan_download_target(download_dir, record)
-    except DownloadError:
+    primary_path = primary_download_path(download_dir, record)
+    if not primary_path.exists():
         return False
-    return plan.final_path.exists()
+    sidecar_path = primary_path.with_name(f"{primary_path.name}.supplemental-metadata.json")
+    if not sidecar_path.exists():
+        return False
+    try:
+        return record.metadata.media_id in sidecar_path.read_text(encoding="utf-8")
+    except OSError:
+        return False
 
 
 async def _download_candidates_async(
@@ -2203,6 +2330,8 @@ async def _download_candidates_async(
     photos_ui: GooglePhotosUi,
     queued_candidates: list[tuple[MediaMetadata, MediaStateRecord]],
     download_concurrency: int,
+    enrichment_concurrency: int,
+    enrich_metadata: bool,
     progress_interactive: bool | None = None,
 ) -> PullExecutionSummary:
     """Description:
@@ -2216,6 +2345,8 @@ async def _download_candidates_async(
         photos_ui: Google Photos UI adapter.
         queued_candidates: Metadata/state pairs selected for download.
         download_concurrency: Number of parallel worker pages.
+        enrichment_concurrency: Number of parallel metadata enrichment pages.
+        enrich_metadata: Whether to fetch post-download detail metadata.
         progress_interactive: Optional override for Rich live progress rendering.
 
     Returns:
@@ -2233,13 +2364,16 @@ async def _download_candidates_async(
     queue: asyncio.Queue[tuple[MediaMetadata, MediaStateRecord]] = asyncio.Queue()
     for candidate in queued_candidates:
         queue.put_nowait(candidate)
+    enrichment_queue: asyncio.Queue[_EnrichmentJob] = asyncio.Queue()
+    enrichment_enabled = enrich_metadata and enrichment_concurrency > 0
 
-    async def worker(slot: int) -> PullExecutionSummary:
+    async def worker(slot: int, page: AsyncPage) -> PullExecutionSummary:
         """Description:
         Process queued downloads on one async Playwright page.
 
         Args:
             slot: Worker slot number.
+            page: Dedicated download worker page.
 
         Returns:
             Partial worker execution counters.
@@ -2248,7 +2382,6 @@ async def _download_candidates_async(
             Opens and closes one page, downloads files, updates progress/state.
         """
 
-        page = await context.new_page()
         downloaded_count = 0
         failed_count = 0
         failure_media_ids: list[str] = []
@@ -2353,6 +2486,7 @@ async def _download_candidates_async(
                         failed_count=failed_count,
                         failure_media_ids=failure_media_ids,
                         progress=progress,
+                        enrichment_queue=enrichment_queue if enrichment_enabled else None,
                     )
                 except BrowserSessionError:
                     raise
@@ -2393,15 +2527,160 @@ async def _download_candidates_async(
             failure_media_ids=tuple(failure_media_ids),
         )
 
-    tasks = [asyncio.create_task(worker(slot)) for slot in range(download_concurrency)]
+    async def enrichment_worker(slot: int, page: AsyncPage) -> None:
+        """Description:
+        Process post-download metadata sidecar enrichment jobs.
+
+        Args:
+            slot: Progress slot number reserved for this enrichment worker.
+            page: Dedicated enrichment page.
+
+        Side Effects:
+            Rewrites sidecars when detail metadata is captured and updates
+            progress rows.
+        """
+
+        try:
+            while True:
+                job = await enrichment_queue.get()
+                try:
+                    progress.update_item(
+                        slot,
+                        "enrich",
+                        _download_item_log_line(
+                            job.metadata,
+                            expected_bytes=job.metadata.bytes_size,
+                        ),
+                    )
+                    begin_at = perf_counter()
+                    detail_metadata = await _enrich_detail_metadata_after_download_async(
+                        page,
+                        metadata=job.metadata,
+                    )
+                    if detail_metadata is not None:
+                        write_takeout_sidecar(job.media_path, job.metadata, detail_metadata)
+                    LOGGER.log(
+                        TIMING_LOG_LEVEL,
+                        "timing enriched slot=%s name=%s enrichment=%.2fs detail=%s queued=%.2fs",
+                        slot + 1,
+                        _display_name(job.metadata),
+                        perf_counter() - begin_at,
+                        detail_metadata is not None,
+                        perf_counter() - job.queued_at,
+                    )
+                    progress.complete_item(
+                        slot,
+                        "enriched" if detail_metadata is not None else "enrich-miss",
+                        _download_item_log_line(
+                            job.metadata,
+                            expected_bytes=job.metadata.bytes_size,
+                        ),
+                    )
+                except Exception as exc:
+                    LOGGER.log(
+                        TIMING_LOG_LEVEL,
+                        "timing failed slot=%s name=%s phase=enrich queued=%.2fs error=%s",
+                        slot + 1,
+                        _display_name(job.metadata),
+                        perf_counter() - job.queued_at,
+                        exc,
+                    )
+                    progress.complete_item(
+                        slot,
+                        "enrich-failed",
+                        _download_item_log_line(
+                            job.metadata,
+                            expected_bytes=job.metadata.bytes_size,
+                        ),
+                    )
+                finally:
+                    enrichment_queue.task_done()
+        finally:
+            from playwright.async_api import Error as PlaywrightError
+
+            with suppress(PlaywrightError):
+                await page.close()
+
+    async def open_download_pages() -> list[AsyncPage]:
+        """Description:
+        Open required download worker pages before optional enrichment pages.
+
+        Returns:
+            Download pages ready for worker tasks.
+
+        Side Effects:
+            Opens browser pages.
+        """
+
+        pages: list[AsyncPage] = []
+        try:
+            for _ in range(download_concurrency):
+                pages.append(await context.new_page())
+        except Exception:
+            await _close_pages(pages)
+            raise
+        return pages
+
+    async def open_enrichment_pages() -> list[AsyncPage]:
+        """Description:
+        Open the dedicated enrichment pages that actually started successfully.
+
+        Returns:
+            Enrichment pages ready for worker tasks.
+
+        Side Effects:
+            Opens browser pages and logs any optional enrichment startup failure.
+        """
+
+        if not enrichment_enabled:
+            return []
+
+        pages: list[AsyncPage] = []
+        for slot in range(enrichment_concurrency):
+            try:
+                pages.append(await context.new_page())
+            except Exception as exc:
+                LOGGER.log(
+                    TIMING_LOG_LEVEL,
+                    "timing failed slot=%s phase=enrich-start error=%s",
+                    download_concurrency + slot + 1,
+                    exc,
+                )
+                break
+        if not pages:
+            LOGGER.log(
+                PHASE_LOG_LEVEL,
+                "Metadata enrichment disabled because no enrichment workers could start.",
+            )
+        return pages
+
+    tasks: list[asyncio.Task[PullExecutionSummary]] = []
+    enrichment_tasks: list[asyncio.Task[None]] = []
+    results: list[PullExecutionSummary] = []
     try:
+        download_pages = await open_download_pages()
+        enrichment_pages = await open_enrichment_pages()
+        enrichment_enabled = bool(enrichment_pages)
+        tasks = [
+            asyncio.create_task(worker(slot, page)) for slot, page in enumerate(download_pages)
+        ]
+        enrichment_tasks = [
+            asyncio.create_task(enrichment_worker(download_concurrency + slot, page))
+            for slot, page in enumerate(enrichment_pages)
+        ]
         results = await asyncio.gather(*tasks)
+        await enrichment_queue.join()
     except asyncio.CancelledError:
         for task in tasks:
             task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
+        for task in enrichment_tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, *enrichment_tasks, return_exceptions=True)
         raise
     finally:
+        for task in enrichment_tasks:
+            task.cancel()
+        await asyncio.gather(*enrichment_tasks, return_exceptions=True)
         progress.close()
 
     return PullExecutionSummary(
@@ -2413,6 +2692,24 @@ async def _download_candidates_async(
             media_id for result in results for media_id in result.failure_media_ids
         ),
     )
+
+
+async def _close_pages(pages: list[AsyncPage]) -> None:
+    """Description:
+    Close a list of Playwright pages, ignoring browser shutdown errors.
+
+    Args:
+        pages: Pages to close.
+
+    Side Effects:
+        Attempts to close each page.
+    """
+
+    from playwright.async_api import Error as PlaywrightError
+
+    for page in pages:
+        with suppress(PlaywrightError):
+            await page.close()
 
 
 async def _start_download_candidate_async(
@@ -2613,17 +2910,20 @@ async def _start_download_candidate_once_async(
             page,
             expected_media_id=metadata.media_id,
         )
-        download, download_trace = await _trigger_detail_download_async(
-            page,
-            slot=slot,
-            metadata=metadata,
-            photos_ui=photos_ui,
-        )
-        await _flush_response_capture(detail_capture)
-        detail_metadata = parse_detail_metadata(
-            detail_capture.response_texts,
-            expected_media_id=metadata.media_id,
-        )
+        try:
+            download, download_trace = await _trigger_detail_download_async(
+                page,
+                slot=slot,
+                metadata=metadata,
+                photos_ui=photos_ui,
+            )
+            await _flush_response_capture(detail_capture)
+            detail_metadata = parse_detail_metadata(
+                detail_capture.response_texts,
+                expected_media_id=metadata.media_id,
+            )
+        finally:
+            await _close_response_capture(detail_capture)
         if on_stage is not None:
             on_stage("download", metadata, download_trace)
         return _pending_download_from_started_download_async(
@@ -2764,6 +3064,7 @@ async def _finalize_pending_download_async(
     failed_count: int,
     failure_media_ids: list[str],
     progress: PullProgressDisplay,
+    enrichment_queue: asyncio.Queue[_EnrichmentJob] | None,
 ) -> tuple[int, int]:
     """Description:
     Save one pending browser download and update state/progress.
@@ -2776,6 +3077,7 @@ async def _finalize_pending_download_async(
         failed_count: Current failure count.
         failure_media_ids: Mutable failed id accumulator.
         progress: Live progress display.
+        enrichment_queue: Optional queue for post-download detail metadata jobs.
 
     Returns:
         Updated success and failure counts.
@@ -2852,6 +3154,7 @@ async def _finalize_pending_download_async(
     finally:
         await _cleanup_playwright_download_async(pending_download.download)
 
+    finalize_elapsed = perf_counter() - finalize_begin_at
     final_metadata = replace(
         pending_download.metadata,
         filename=final_path.name,
@@ -2864,25 +3167,37 @@ async def _finalize_pending_download_async(
         ),
         bytes_size=final_path.stat().st_size,
     )
+    LOGGER.log(
+        TIMING_LOG_LEVEL,
+        "timing finalized slot=%s name=%s finalize=%.2fs total=%.2fs bytes=%s",
+        pending_download.slot + 1,
+        _display_name(final_metadata),
+        finalize_elapsed,
+        perf_counter() - pending_download.queued_at,
+        final_metadata.bytes_size or 0,
+    )
+
     write_takeout_sidecar(
         final_path,
         final_metadata,
         pending_download.detail_metadata,
     )
     detail_metadata = pending_download.detail_metadata
-    if detail_metadata is None:
-        detail_metadata = await _enrich_detail_metadata_after_download_async(
-            pending_download.page,
-            metadata=final_metadata,
+    if enrichment_queue is not None and detail_metadata is None:
+        enrichment_queue.put_nowait(
+            _EnrichmentJob(
+                media_path=final_path,
+                metadata=final_metadata,
+                queued_at=perf_counter(),
+            )
         )
-        if detail_metadata is not None:
-            write_takeout_sidecar(final_path, final_metadata, detail_metadata)
     LOGGER.log(
         TIMING_LOG_LEVEL,
-        "timing done slot=%s name=%s finalize=%.2fs total=%.2fs bytes=%s",
+        "timing done slot=%s name=%s finalize=%.2fs enrichment_queued=%s total=%.2fs bytes=%s",
         pending_download.slot + 1,
         _display_name(final_metadata),
-        perf_counter() - finalize_begin_at,
+        finalize_elapsed,
+        enrichment_queue is not None and detail_metadata is None,
         perf_counter() - pending_download.queued_at,
         final_metadata.bytes_size or 0,
     )
@@ -2923,16 +3238,91 @@ async def _enrich_detail_metadata_after_download_async(
 
     from playwright.async_api import Error as PlaywrightError
 
+    capture: _AsyncResponseCapture | None = None
     try:
-        capture = _install_detail_response_capture(page, expected_media_id=metadata.media_id)
-        await page.goto(metadata.product_url, wait_until="domcontentloaded")
-        with suppress(PlaywrightError):
-            await page.get_by_label("Info").first.click(timeout=2_000)
-        await _wait_for_capture_count(capture, previous_count=0, timeout_seconds=2.0)
-        await _flush_response_capture(capture)
-    except Exception:
+        async with asyncio.timeout(DETAIL_METADATA_ENRICHMENT_TIMEOUT_SECONDS):
+            capture = _install_detail_response_capture(page, expected_media_id=metadata.media_id)
+            await page.goto(metadata.product_url, wait_until="domcontentloaded")
+            detail = await _parse_detail_capture(capture, expected_media_id=metadata.media_id)
+            if detail is not None:
+                return detail
+
+            info_button = page.get_by_label("Info").first
+            await info_button.wait_for(state="visible")
+            detail = await _parse_detail_capture(capture, expected_media_id=metadata.media_id)
+            if detail is not None:
+                return detail
+
+            await info_button.click()
+            return await _wait_for_detail_metadata_response(
+                capture,
+                expected_media_id=metadata.media_id,
+                timeout_seconds=DETAIL_METADATA_ENRICHMENT_TIMEOUT_SECONDS,
+            )
+    except (PlaywrightError, TimeoutError):
         return None
-    return parse_detail_metadata(capture.response_texts, expected_media_id=metadata.media_id)
+    finally:
+        if capture is not None:
+            await _close_response_capture(capture, drain=False)
+
+
+async def _parse_detail_capture(
+    capture: _AsyncResponseCapture,
+    *,
+    expected_media_id: str,
+) -> DetailMetadata | None:
+    """Description:
+    Parse any detail metadata already captured for one media item.
+
+    Args:
+        capture: Active detail response capture.
+        expected_media_id: Media id required by the detail parser.
+
+    Returns:
+        Parsed detail metadata, or `None`.
+
+    Side Effects:
+        Waits for currently scheduled response capture tasks.
+    """
+
+    await _flush_response_capture(capture)
+    return parse_detail_metadata(capture.response_texts, expected_media_id=expected_media_id)
+
+
+async def _wait_for_detail_metadata_response(
+    capture: _AsyncResponseCapture,
+    *,
+    expected_media_id: str,
+    timeout_seconds: float,
+) -> DetailMetadata | None:
+    """Description:
+    Wait for accepted response events until detail metadata is captured.
+
+    Args:
+        capture: Active detail response capture.
+        expected_media_id: Media id required by the detail parser.
+        timeout_seconds: Total maximum wait.
+
+    Returns:
+        Parsed detail metadata, or `None` when the timeout expires.
+
+    Side Effects:
+        Waits on accepted response events and parses captured payloads.
+    """
+
+    try:
+        async with asyncio.timeout(timeout_seconds):
+            while True:
+                detail = await _parse_detail_capture(capture, expected_media_id=expected_media_id)
+                if detail is not None:
+                    return detail
+                capture.accepted_event.clear()
+                detail = await _parse_detail_capture(capture, expected_media_id=expected_media_id)
+                if detail is not None:
+                    return detail
+                await capture.accepted_event.wait()
+    except TimeoutError:
+        return None
 
 
 def _install_detail_response_capture(
@@ -3181,9 +3571,9 @@ async def _trigger_detail_download_async(
                 slot + 1,
                 _display_name(metadata),
             )
-            await photos_ui.wait_for_detail_actions_async(page, timeout_ms=5_000)
+            await photos_ui.wait_for_detail_actions_async(page, timeout_ms=10_000)
             await photos_ui.open_download_menu_async(page)
-            await photos_ui.wait_for_download_action_async(page, timeout_ms=5_000)
+            await photos_ui.wait_for_download_action_async(page, timeout_ms=10_000)
             LOGGER.log(
                 TIMING_LOG_LEVEL,
                 "timing request slot=%s name=%s mode=detail step=menu-ready elapsed=%.2fs",

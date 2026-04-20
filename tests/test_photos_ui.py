@@ -82,7 +82,7 @@ class GooglePhotosUiTests(unittest.TestCase):
             ['[aria-label="More options"]:visible', '[role="menu"]'],
         )
         self.assertEqual(page.clicked_indexes, [0, 1])
-        self.assertEqual(page.click_timeouts, [5000, 5000])
+        self.assertEqual(page.click_timeouts, [10000, 10000])
         self.assertEqual(page.keyboard.presses, ["Escape"])
         self.assertEqual(page.wait_calls, [])
         self.assertEqual(page.wait_states, ["hidden"])

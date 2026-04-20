@@ -84,12 +84,14 @@ Example `gphoto-pull.toml`:
 ```toml
 # Omit this to download into the current working directory.
 # download_dir = "downloads"
-download_concurrency = 4
+download_concurrency = 3
+enrichment_concurrency = 5
 sync_db_path = "state/pull-state.sqlite3"
 diagnostics_dir = "diagnostics"
 browsers_path = "browsers"
 browser_profile_dir = "chrome-profile"
 headless = true
+enrich_metadata = true
 
 # Usually pass these on the command line instead.
 # after = "Jan 1 2026"
@@ -102,6 +104,10 @@ headless = true
 Do not use environment variables for normal configuration. Put durable defaults in
 `gphoto-pull.toml` and use CLI flags for one-off overrides.
 
+Use `--no-enrich-metadata` to skip post-download detail-page metadata enrichment for a faster
+pull, or `--enrich-metadata` to force it on when the config disables it. Enrichment runs on a
+separate worker pool controlled by `enrichment_concurrency`.
+
 ## How Pull Works
 
 1. Launches the persistent browser profile.
@@ -110,7 +116,8 @@ Do not use environment variables for normal configuration. Put durable defaults 
 4. Persists candidates in SQLite and skips already-downloaded files.
 5. Downloads originals with concurrent workers, preferring direct URLs when proven and falling
    back to the Google Photos detail-page Download action.
-6. Finalizes downloads atomically into `downloads/` and records trace metadata.
+6. Finalizes downloads atomically, writes sidecar metadata, and optionally enriches sidecars from
+   the detail page.
 
 ## Troubleshooting
 

@@ -32,7 +32,8 @@ from gphoto_pull.config import (
 from gphoto_pull.interrupts import cooperative_sigint_handling, raise_if_interrupt_requested
 
 DEFAULT_CONFIG_VALUES = {
-    "download_concurrency": "4",
+    "download_concurrency": "3",
+    "enrichment_concurrency": "5",
     "sync_db_path": "state/pull-state.sqlite3",
     "diagnostics_dir": "diagnostics",
     "browsers_path": "browsers",
@@ -155,7 +156,10 @@ class PullCommand:
         before: Optional exclusive upper-bound timestamp override.
         download_dir: Optional output directory override.
         concurrency: Optional parallel worker count override.
+        enrichment_concurrency: Optional parallel metadata enrichment worker count override.
         headed: Show the pull browser instead of running headless.
+        enrich_metadata: Enable post-download detail metadata enrichment for this run.
+        no_enrich_metadata: Disable post-download detail metadata enrichment for this run.
         dry_run: Enumerate/report without starting downloads.
     """
 
@@ -163,7 +167,10 @@ class PullCommand:
     before: str | None = None
     download_dir: str | None = None
     concurrency: int | None = None
+    enrichment_concurrency: int | None = None
     headed: bool = False
+    enrich_metadata: Annotated[bool, tyro.conf.FlagCreatePairsOff] = False
+    no_enrich_metadata: Annotated[bool, tyro.conf.FlagCreatePairsOff] = False
     dry_run: bool = False
 
 
@@ -337,6 +344,8 @@ def _config_path_from_args(args: CliArgs, *, config_dir: Path) -> Path | None:
     config_path = Path(args.config).expanduser()
     if config_path.is_absolute():
         return config_path
+    if args.config_dir is None:
+        return config_path
     return config_dir / config_path
 
 
@@ -356,13 +365,25 @@ def _config_overrides(args: CliArgs) -> ConfigOverrides:
     before: str | None = None
     download_dir: str | None = None
     download_concurrency: int | None = None
+    enrichment_concurrency: int | None = None
     headless: bool | None = None
+    enrich_metadata: bool | None = None
 
     if isinstance(command, PullCommand | RefreshCommand):
         after = command.after
         before = command.before
         download_dir = command.download_dir if isinstance(command, PullCommand) else None
         download_concurrency = command.concurrency if isinstance(command, PullCommand) else None
+        enrichment_concurrency = (
+            command.enrichment_concurrency if isinstance(command, PullCommand) else None
+        )
+        if isinstance(command, PullCommand):
+            if command.enrich_metadata and command.no_enrich_metadata:
+                raise ConfigError("Use only one of --enrich-metadata or --no-enrich-metadata.")
+            if command.enrich_metadata:
+                enrich_metadata = True
+            elif command.no_enrich_metadata:
+                enrich_metadata = False
         if command.headed:
             headless = False
 
@@ -371,10 +392,12 @@ def _config_overrides(args: CliArgs) -> ConfigOverrides:
         before=before,
         download_dir=download_dir,
         download_concurrency=download_concurrency,
+        enrichment_concurrency=enrichment_concurrency,
         browser_profile_dir=args.browser_profile_dir,
         browser_binary=args.browser_binary,
         browsers_path=args.browsers_path,
         headless=headless,
+        enrich_metadata=enrich_metadata,
         progress_interactive=False if args.verbose else None,
     )
 
@@ -496,11 +519,13 @@ def _render_config_toml(values: dict[str, str | bool]) -> str:
         "# Command-line options override these values.",
         "",
         f"download_concurrency = {values['download_concurrency']}",
+        f"enrichment_concurrency = {values['enrichment_concurrency']}",
         f"sync_db_path = {_toml_string(str(values['sync_db_path']))}",
         f"diagnostics_dir = {_toml_string(str(values['diagnostics_dir']))}",
         f"browsers_path = {_toml_string(str(values['browsers_path']))}",
         f"browser_profile_dir = {_toml_string(str(values['browser_profile_dir']))}",
         f"headless = {str(values['headless']).lower()}",
+        f"enrich_metadata = {str(values['enrich_metadata']).lower()}",
     ]
 
     after = values.get("after")
@@ -535,12 +560,17 @@ def _config_values_from_prompts(*, use_defaults: bool) -> dict[str, str | bool]:
         return {
             **DEFAULT_CONFIG_VALUES,
             "headless": True,
+            "enrich_metadata": True,
         }
 
     values: dict[str, str | bool] = {
         "download_concurrency": _prompt_text(
             "Download concurrency",
             default=DEFAULT_CONFIG_VALUES["download_concurrency"],
+        ),
+        "enrichment_concurrency": _prompt_text(
+            "Metadata enrichment concurrency",
+            default=DEFAULT_CONFIG_VALUES["enrichment_concurrency"],
         ),
         "sync_db_path": _prompt_text(
             "Sync database path, relative to config dir unless absolute",
@@ -559,6 +589,10 @@ def _config_values_from_prompts(*, use_defaults: bool) -> dict[str, str | bool]:
             default=DEFAULT_CONFIG_VALUES["browser_profile_dir"],
         ),
         "headless": _prompt_bool("Run pull headless by default", default=True),
+        "enrich_metadata": _prompt_bool(
+            "Fetch detail metadata sidecars after direct downloads",
+            default=True,
+        ),
     }
 
     after = _prompt_optional_text("Default cutoff timestamp, or leave blank to pass --after")

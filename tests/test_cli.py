@@ -1,4 +1,5 @@
 import io
+import os
 import sys
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
@@ -85,7 +86,10 @@ class CliTests(unittest.TestCase):
                 "archive",
                 "--concurrency",
                 "8",
+                "--enrichment-concurrency",
+                "11",
                 "--headed",
+                "--no-enrich-metadata",
             ]
         )
 
@@ -97,7 +101,10 @@ class CliTests(unittest.TestCase):
         self.assertEqual(command.before, "2026-01-03T03:04:05-08:00")
         self.assertEqual(command.download_dir, "archive")
         self.assertEqual(command.concurrency, 8)
+        self.assertEqual(command.enrichment_concurrency, 11)
         self.assertTrue(command.headed)
+        self.assertFalse(command.enrich_metadata)
+        self.assertTrue(command.no_enrich_metadata)
 
     def test_main_runs_login_command(self) -> None:
         config = ProjectConfig.from_sources(config_path=MISSING_CONFIG_PATH)
@@ -178,7 +185,10 @@ class CliTests(unittest.TestCase):
                         "archive",
                         "--concurrency",
                         "8",
+                        "--enrichment-concurrency",
+                        "11",
                         "--headed",
+                        "--no-enrich-metadata",
                         "--dry-run",
                     ]
                 )
@@ -188,11 +198,41 @@ class CliTests(unittest.TestCase):
             self.assertEqual(created_config.config_dir, config_path.parent)
             self.assertEqual(created_config.download_dir, Path.cwd() / "archive")
             self.assertEqual(created_config.download_concurrency, 8)
+            self.assertEqual(created_config.enrichment_concurrency, 11)
             self.assertFalse(created_config.headless)
+            self.assertFalse(created_config.enrich_metadata)
             assert created_config.after is not None
             assert created_config.before is not None
             self.assertEqual(created_config.after.isoformat(), "2026-01-02T03:04:05-08:00")
             self.assertEqual(created_config.before.isoformat(), "2026-01-03T03:04:05-08:00")
+
+    def test_main_uses_relative_config_path_once(self) -> None:
+        original_cwd = Path.cwd()
+        with TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            config_path = root / "configs" / "dev.toml"
+            config_path.parent.mkdir()
+            config_path.write_text('sync_db_path = "state.sqlite3"\n', encoding="utf-8")
+            with (
+                patch("gphoto_pull.cli.GooglePhotosPuller") as puller_class,
+                io.StringIO() as stderr,
+                redirect_stderr(stderr),
+            ):
+                service = MagicMock()
+                service.pull.return_value = ["planned"]
+                puller_class.return_value = service
+                try:
+                    os.chdir(root)
+                    exit_code = main(["--config", "configs/dev.toml", "pull", "--dry-run"])
+                finally:
+                    os.chdir(original_cwd)
+
+            created_config = puller_class.call_args.args[0]
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(created_config.config_file, Path("configs/dev.toml"))
+        self.assertTrue(created_config.config_file_loaded)
+        self.assertEqual(created_config.sync_db_path, Path("configs/state.sqlite3"))
 
     def test_main_runs_refresh_reset_command(self) -> None:
         with TemporaryDirectory() as tmp_dir:
@@ -248,6 +288,8 @@ class CliTests(unittest.TestCase):
                 contents,
             )
             self.assertIn("headless = true", contents)
+            self.assertIn("enrichment_concurrency = 5", contents)
+            self.assertIn("enrich_metadata = true", contents)
             self.assertNotIn("browser_binary =", contents)
             self.assertIn("gphoto-pull install-browser", rendered)
 
@@ -283,10 +325,12 @@ class CliTests(unittest.TestCase):
             answers = iter(
                 [
                     "8",
+                    "12",
                     "state.sqlite3",
                     "diag",
                     "pw-browsers",
                     "profile-override",
+                    "n",
                     "n",
                     "2026-01-02T03:04:05-08:00",
                     "2026-01-03T03:04:05-08:00",
@@ -309,11 +353,13 @@ class CliTests(unittest.TestCase):
             contents = config_path.read_text(encoding="utf-8")
             self.assertNotIn("download_dir =", contents)
             self.assertIn("download_concurrency = 8", contents)
+            self.assertIn("enrichment_concurrency = 12", contents)
             self.assertIn('sync_db_path = "state.sqlite3"', contents)
             self.assertIn('diagnostics_dir = "diag"', contents)
             self.assertIn('browsers_path = "pw-browsers"', contents)
             self.assertIn('browser_profile_dir = "profile-override"', contents)
             self.assertIn("headless = false", contents)
+            self.assertIn("enrich_metadata = false", contents)
             self.assertIn('after = "2026-01-02T03:04:05-08:00"', contents)
             self.assertIn('before = "2026-01-03T03:04:05-08:00"', contents)
             self.assertIn('browser_binary = "custom-chromium"', contents)

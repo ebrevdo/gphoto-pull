@@ -78,6 +78,40 @@ class PullStateStoreTests(unittest.TestCase):
             self.assertEqual(len(all_records), 1)
             self.assertEqual(all_records[0].metadata.media_id, "media-001")
 
+    def test_upsert_preserves_rich_metadata_when_later_discovery_is_sparse(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            rich_metadata = MediaMetadata(
+                media_id="media-001",
+                filename="IMG_0001.JPG",
+                capture_time=datetime(2026, 3, 15, 10, 30, tzinfo=UTC),
+                uploaded_time=datetime(2026, 3, 17, 14, 5, tzinfo=UTC),
+                mime_type="image/jpeg",
+                media_type="photo",
+                product_url="https://photos.google.com/photo/media-001",
+                preview_url="https://photos.fife.usercontent.google.com/pw/example-1",
+                width=4032,
+                height=3024,
+                bytes_size=2_400_000,
+            )
+            sparse_metadata = MediaMetadata(
+                media_id="media-001",
+                filename="unresolved-media-001",
+                uploaded_time=datetime(2026, 3, 17, 14, 5, tzinfo=UTC),
+            )
+
+            with PullStateStore(Path(tmp_dir) / "pull-state.sqlite3") as store:
+                store.upsert_media(rich_metadata)
+                loaded = store.upsert_media(sparse_metadata)
+
+            self.assertEqual(loaded.metadata.filename, "IMG_0001.JPG")
+            self.assertEqual(loaded.metadata.mime_type, "image/jpeg")
+            self.assertEqual(loaded.metadata.media_type, "photo")
+            self.assertEqual(loaded.metadata.product_url, rich_metadata.product_url)
+            self.assertEqual(loaded.metadata.preview_url, rich_metadata.preview_url)
+            self.assertEqual(loaded.metadata.width, 4032)
+            self.assertEqual(loaded.metadata.height, 3024)
+            self.assertEqual(loaded.metadata.bytes_size, 2_400_000)
+
     def test_manage_checkpoints(self) -> None:
         with TemporaryDirectory() as tmp_dir:
             with PullStateStore(Path(tmp_dir) / "pull-state.sqlite3") as store:

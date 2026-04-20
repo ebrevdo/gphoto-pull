@@ -434,7 +434,7 @@ class GooglePhotosUi:
             error_message="Could not find a visible 'More options' control.",
         )
 
-    def wait_for_download_action(self, page: Page, *, timeout_ms: int = 5_000) -> None:
+    def wait_for_download_action(self, page: Page, *, timeout_ms: int = 10_000) -> None:
         """Description:
         Wait for a visible Download action in the open menu.
 
@@ -458,7 +458,7 @@ class GooglePhotosUi:
         self,
         page: AsyncPage,
         *,
-        timeout_ms: int = 5_000,
+        timeout_ms: int = 10_000,
     ) -> None:
         """Description:
         Wait for a visible Download action in the open menu.
@@ -662,7 +662,7 @@ class GooglePhotosUi:
         last_error: Exception | None = None
         for index in range(visible_count):
             try:
-                locator.nth(index).click(timeout=5_000)
+                locator.nth(index).click(timeout=10_000)
                 self.wait_for_download_action(page, timeout_ms=1_000)
                 return
             except Exception as exc:
@@ -703,7 +703,7 @@ class GooglePhotosUi:
         last_error: Exception | None = None
         for index in range(visible_count):
             try:
-                await locator.nth(index).click(timeout=5_000)
+                await locator.nth(index).click(timeout=10_000)
                 await self.wait_for_download_action_async(page, timeout_ms=1_000)
                 return
             except Exception as exc:
@@ -890,7 +890,7 @@ def _click_first_visible_selector(
     *,
     selectors: tuple[str, ...],
     error_message: str,
-    timeout_ms: int = 5_000,
+    timeout_ms: int = 10_000,
 ) -> None:
     """Description:
     Click the first visible selector from a candidate set.
@@ -916,7 +916,7 @@ async def _click_first_visible_selector_async(
     *,
     selectors: tuple[str, ...],
     error_message: str,
-    timeout_ms: int = 5_000,
+    timeout_ms: int = 10_000,
 ) -> None:
     """Description:
     Click the first visible selector from a candidate set on an async page.

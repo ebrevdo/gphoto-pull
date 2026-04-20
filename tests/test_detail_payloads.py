@@ -1,6 +1,7 @@
-import json
 import unittest
 from datetime import UTC, datetime
+
+import msgspec.json
 
 from gphoto_pull.detail_payloads import parse_detail_metadata
 
@@ -32,9 +33,10 @@ def _detail_response() -> str:
             ]
         ],
     ]
+    payload_text = msgspec.json.encode([item]).decode()
     return (
         """)]}'\n\n258\n"""
-        + json.dumps([["wrb.fr", "detailRpc", json.dumps([item]), None, None, None]])
+        + msgspec.json.encode([["wrb.fr", "detailRpc", payload_text, None, None, None]]).decode()
         + "\n"
     )
 

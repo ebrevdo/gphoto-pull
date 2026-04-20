@@ -1,8 +1,8 @@
 # pyright: reportPrivateUsage=false
 
 import asyncio
-import json
 import unittest
+from collections.abc import Callable
 from datetime import UTC, datetime
 from io import StringIO
 from pathlib import Path
@@ -11,26 +11,35 @@ from types import SimpleNamespace
 from typing import TYPE_CHECKING, cast
 from unittest.mock import patch
 
+import msgspec.json
+
 from gphoto_pull.automation import (
     _AsyncResponseCapture,
     _build_download_trace_async,
+    _close_response_capture,
     _direct_download_urls_for_metadata,
     _download_candidates_async,
+    _EnrichmentJob,
     _finalize_pending_download_async,
     _page_recent_payloads_to_window,
     _PendingDownload,
+    _persist_recent_payloads_from_responses,
     _recent_payload_cursor,
     _recent_payload_stats,
     _RecentPageRequest,
     _start_download_candidate_async,
     _store_recent_page_checkpoint,
+    _target_path_exists,
     _update_recent_payload_stats,
+    _wait_for_detail_metadata_response,
 )
 from gphoto_pull.download import DownloadError, DownloadPlan
 from gphoto_pull.models import DownloadTrace, MediaMetadata, MediaStateRecord
 from gphoto_pull.photos_ui import GooglePhotosUi
 from gphoto_pull.progress import PullProgressDisplay
+from gphoto_pull.rpc_payloads import JsonValue
 from gphoto_pull.state import PullStateStore
+from gphoto_pull.takeout import TakeoutSidecar
 
 if TYPE_CHECKING:
     from playwright.async_api import APIRequestContext, BrowserContext, Download, Page, Response
@@ -88,6 +97,30 @@ class _FakeContext:
         return _FakePage()
 
 
+class _FakeLimitedContext:
+    def __init__(self, *, limit: int) -> None:
+        self.limit = limit
+        self.calls = 0
+        self.pages: list[_FakePage] = []
+
+    async def new_page(self) -> _FakePage:
+        self.calls += 1
+        if len(self.pages) >= self.limit:
+            raise RuntimeError("page limit reached")
+        page = _FakePage()
+        self.pages.append(page)
+        return page
+
+
+class _FakeCapturePage:
+    def __init__(self) -> None:
+        self.removed = False
+
+    def remove_listener(self, event: str, handler: object) -> None:
+        del event, handler
+        self.removed = True
+
+
 class _FakePlaywrightDownload:
     def __init__(self, content: bytes) -> None:
         self._content = content
@@ -123,8 +156,18 @@ class _FakeApiRequestContext:
         headers: dict[str, str],
     ) -> _FakeApiResponse:
         del url, headers
-        request = json.loads(form["f.req"])
-        inner = json.loads(request[0][0][1])
+        request = cast(JsonValue, msgspec.json.decode(form["f.req"].encode()))
+        if not isinstance(request, list) or not request or not isinstance(request[0], list):
+            raise AssertionError("unexpected f.req shape")
+        group = request[0]
+        if not group or not isinstance(group[0], list) or len(group[0]) <= 1:
+            raise AssertionError("unexpected f.req group shape")
+        inner_text = group[0][1]
+        if not isinstance(inner_text, str):
+            raise AssertionError("unexpected f.req inner payload")
+        inner = cast(JsonValue, msgspec.json.decode(inner_text.encode()))
+        if not isinstance(inner, list) or len(inner) <= 2:
+            raise AssertionError("unexpected f.req inner shape")
         self.requested_cursors.append(str(inner[2]))
         return _FakeApiResponse(self._responses.pop(0))
 
@@ -143,20 +186,55 @@ def _recent_raw(media_id: str, upload_ms: int, cursor: str) -> str:
         ],
         cursor,
     ]
+    payload_text = msgspec.json.encode(payload).decode()
     return (
         """)]}'\n\n258\n"""
-        + json.dumps([["wrb.fr", "opaqueRecentRpc", json.dumps(payload), None, None, None]])
+        + msgspec.json.encode(
+            [["wrb.fr", "opaqueRecentRpc", payload_text, None, None, None]]
+        ).decode()
         + "\n"
     )
 
 
 def _cursor_only_raw(cursor: str) -> str:
     payload = [None, cursor]
+    payload_text = msgspec.json.encode(payload).decode()
     return (
         """)]}'\n\n258\n"""
-        + json.dumps([["wrb.fr", "opaqueRecentRpc", json.dumps(payload), None, None, None]])
+        + msgspec.json.encode(
+            [["wrb.fr", "opaqueRecentRpc", payload_text, None, None, None]]
+        ).decode()
         + "\n"
     )
+
+
+def _detail_raw(media_id: str) -> str:
+    item: list[JsonValue] = [
+        media_id,
+        "caption",
+        "IMG_0001.JPG",
+        1467939770000,
+        -25200000,
+        12345,
+        100,
+        200,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    ]
+    payload_text = msgspec.json.encode([item]).decode()
+    return (
+        """)]}'\n\n258\n"""
+        + msgspec.json.encode([["wrb.fr", "detailRpc", payload_text, None, None, None]]).decode()
+        + "\n"
+    )
+
+
+def _noop_response_handler(response: object) -> None:
+    del response
 
 
 class DownloadTraceTests(unittest.TestCase):
@@ -254,6 +332,8 @@ class DownloadTraceTests(unittest.TestCase):
                     response_texts=[initial],
                     tasks=set(),
                     accepted_event=asyncio.Event(),
+                    page=cast("Page", SimpleNamespace()),
+                    response_handler=cast("Callable[[Response], None]", _noop_response_handler),
                 )
                 return await _page_recent_payloads_to_window(
                     cast("APIRequestContext", request_context),
@@ -283,6 +363,90 @@ class DownloadTraceTests(unittest.TestCase):
                 "first-page-cursor",
             ],
         )
+
+    def test_persist_recent_payloads_from_captured_responses_updates_index(self) -> None:
+        raw_text = _recent_raw("AF1QipCaptured", 1770000100000, "next-cursor")
+
+        with (
+            TemporaryDirectory() as tmp_dir,
+            PullStateStore(Path(tmp_dir) / "index.sqlite3") as store,
+        ):
+            _persist_recent_payloads_from_responses(store, [raw_text])
+            record = store.get_media("AF1QipCaptured")
+            covered = store.upload_coverage_satisfies(datetime(2026, 2, 3, tzinfo=UTC))
+
+        self.assertIsNotNone(record)
+        assert record is not None
+        self.assertEqual(record.metadata.product_url, "https://photos.google.com/photo/AF1QipCaptured")
+        self.assertTrue(covered)
+
+    def test_wait_for_detail_metadata_response_returns_none_after_timeout(self) -> None:
+        capture = _AsyncResponseCapture(
+            response_texts=[],
+            tasks=set(),
+            accepted_event=asyncio.Event(),
+            page=cast("Page", SimpleNamespace()),
+            response_handler=cast("Callable[[Response], None]", _noop_response_handler),
+        )
+
+        detail = asyncio.run(
+            _wait_for_detail_metadata_response(
+                capture,
+                expected_media_id="AF1QipMissing",
+                timeout_seconds=0.01,
+            )
+        )
+
+        self.assertIsNone(detail)
+
+    def test_wait_for_detail_metadata_response_wakes_on_matching_capture(self) -> None:
+        async def run() -> str | None:
+            capture = _AsyncResponseCapture(
+                response_texts=[],
+                tasks=set(),
+                accepted_event=asyncio.Event(),
+                page=cast("Page", SimpleNamespace()),
+                response_handler=cast("Callable[[Response], None]", _noop_response_handler),
+            )
+            task = asyncio.create_task(
+                _wait_for_detail_metadata_response(
+                    capture,
+                    expected_media_id="AF1QipDetail",
+                    timeout_seconds=1.0,
+                )
+            )
+            await asyncio.sleep(0)
+            capture.response_texts.append(_detail_raw("AF1QipDetail"))
+            capture.accepted_event.set()
+            detail = await task
+            return None if detail is None else detail.media_id
+
+        self.assertEqual(asyncio.run(run()), "AF1QipDetail")
+
+    def test_close_response_capture_can_cancel_without_draining(self) -> None:
+        async def run() -> tuple[bool, bool]:
+            event = asyncio.Event()
+            async def wait_forever() -> None:
+                await event.wait()
+
+            task = asyncio.create_task(wait_forever())
+            page = _FakeCapturePage()
+            capture = _AsyncResponseCapture(
+                response_texts=[],
+                tasks={task},
+                accepted_event=asyncio.Event(),
+                page=cast("Page", page),
+                response_handler=cast("Callable[[Response], None]", _noop_response_handler),
+            )
+
+            await asyncio.wait_for(_close_response_capture(capture, drain=False), timeout=0.1)
+            await asyncio.sleep(0)
+            return page.removed, task.cancelled()
+
+        removed, cancelled = asyncio.run(run())
+
+        self.assertTrue(removed)
+        self.assertTrue(cancelled)
 
     def test_build_download_trace_prefers_attachment_response(self) -> None:
         async def run() -> DownloadTrace:
@@ -390,6 +554,62 @@ class DownloadTraceTests(unittest.TestCase):
             ),
         )
 
+    def test_target_path_exists_checks_primary_path_before_collision_suffixing(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            download_dir = Path(tmp_dir) / "downloads"
+            primary = download_dir / "uploaded" / "2026" / "04" / "19" / "IMG_0001.JPG"
+            primary.parent.mkdir(parents=True)
+            primary.write_bytes(b"image")
+            primary.with_name("IMG_0001.JPG.supplemental-metadata.json").write_text(
+                '"url": "https://photos.google.com/photo/AF1QipSame"',
+                encoding="utf-8",
+            )
+            record = MediaStateRecord(
+                metadata=MediaMetadata(
+                    media_id="AF1QipSame",
+                    filename="IMG_0001.JPG",
+                    uploaded_time=datetime(2026, 4, 19, tzinfo=UTC),
+                )
+            )
+
+            self.assertTrue(_target_path_exists(record, download_dir=download_dir))
+
+    def test_target_path_exists_does_not_skip_different_media_collision(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            download_dir = Path(tmp_dir) / "downloads"
+            primary = download_dir / "uploaded" / "2026" / "04" / "19" / "IMG_0001.JPG"
+            primary.parent.mkdir(parents=True)
+            primary.write_bytes(b"image")
+            primary.with_name("IMG_0001.JPG.supplemental-metadata.json").write_text(
+                '"url": "https://photos.google.com/photo/AF1QipOther"',
+                encoding="utf-8",
+            )
+            record = MediaStateRecord(
+                metadata=MediaMetadata(
+                    media_id="AF1QipSame",
+                    filename="IMG_0001.JPG",
+                    uploaded_time=datetime(2026, 4, 19, tzinfo=UTC),
+                )
+            )
+
+            self.assertFalse(_target_path_exists(record, download_dir=download_dir))
+
+    def test_target_path_exists_does_not_skip_without_sidecar(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            download_dir = Path(tmp_dir) / "downloads"
+            primary = download_dir / "uploaded" / "2026" / "04" / "19" / "IMG_0001.JPG"
+            primary.parent.mkdir(parents=True)
+            primary.write_bytes(b"manual image")
+            record = MediaStateRecord(
+                metadata=MediaMetadata(
+                    media_id="AF1QipSame",
+                    filename="IMG_0001.JPG",
+                    uploaded_time=datetime(2026, 4, 19, tzinfo=UTC),
+                )
+            )
+
+            self.assertFalse(_target_path_exists(record, download_dir=download_dir))
+
     def test_download_candidates_finalizes_trailing_pending_downloads(self) -> None:
         metadata = MediaMetadata(media_id="media-1", filename="file-1")
         pending_download = SimpleNamespace(
@@ -409,8 +629,10 @@ class DownloadTraceTests(unittest.TestCase):
             failed_count: int,
             failure_media_ids: list[str],
             progress: PullProgressDisplay,
+            enrichment_queue: asyncio.Queue[object] | None,
         ) -> tuple[int, int]:
             del diagnostics_dir, state_store, failure_media_ids, progress
+            self.assertIsNotNone(enrichment_queue)
             finalized.append(current_pending)
             return downloaded_count + 1, failed_count
 
@@ -438,12 +660,154 @@ class DownloadTraceTests(unittest.TestCase):
                         )
                     ],
                     download_concurrency=2,
+                    enrichment_concurrency=2,
+                    enrich_metadata=True,
                 )
             )
 
         self.assertEqual(finalized, [pending_download])
         self.assertEqual(summary.downloaded_count, 1)
         self.assertEqual(summary.failed_count, 0)
+
+    def test_download_candidates_disables_enrichment_when_workers_cannot_start(self) -> None:
+        metadata = MediaMetadata(media_id="media-1", filename="file-1")
+        pending_download = SimpleNamespace(
+            slot=0,
+            metadata=metadata,
+            download_trace=DownloadTrace(content_length=1),
+            download_event_at=0.0,
+        )
+        observed_enrichment_queues: list[asyncio.Queue[object] | None] = []
+
+        async def fake_finalize(
+            current_pending: SimpleNamespace,
+            *,
+            diagnostics_dir: Path,
+            state_store: PullStateStore,
+            downloaded_count: int,
+            failed_count: int,
+            failure_media_ids: list[str],
+            progress: PullProgressDisplay,
+            enrichment_queue: asyncio.Queue[object] | None,
+        ) -> tuple[int, int]:
+            del current_pending, diagnostics_dir, state_store, failure_media_ids, progress
+            observed_enrichment_queues.append(enrichment_queue)
+            return downloaded_count + 1, failed_count
+
+        context = _FakeLimitedContext(limit=1)
+        with (
+            patch(
+                "gphoto_pull.automation._start_download_candidate_async",
+                return_value=pending_download,
+            ),
+            patch(
+                "gphoto_pull.automation._finalize_pending_download_async",
+                side_effect=fake_finalize,
+            ),
+        ):
+            summary = asyncio.run(
+                _download_candidates_async(
+                    cast("BrowserContext", context),
+                    diagnostics_dir=Path("tmp-diagnostics"),
+                    download_dir=Path("tmp-downloads"),
+                    state_store=cast(PullStateStore, SimpleNamespace()),
+                    photos_ui=cast(GooglePhotosUi, SimpleNamespace()),
+                    queued_candidates=[(metadata, MediaStateRecord(metadata=metadata))],
+                    download_concurrency=1,
+                    enrichment_concurrency=2,
+                    enrich_metadata=True,
+                )
+            )
+
+        self.assertEqual(summary.downloaded_count, 1)
+        self.assertEqual(summary.failed_count, 0)
+        self.assertEqual(observed_enrichment_queues, [None])
+        self.assertEqual(context.calls, 2)
+
+    def test_download_candidates_reserves_download_pages_before_enrichment_pages(self) -> None:
+        metadata = MediaMetadata(media_id="media-1", filename="file-1")
+        pending_download = SimpleNamespace(
+            slot=0,
+            metadata=metadata,
+            download_trace=DownloadTrace(content_length=1),
+            download_event_at=0.0,
+        )
+        observed_enrichment_queues: list[asyncio.Queue[object] | None] = []
+
+        async def fake_finalize(
+            current_pending: SimpleNamespace,
+            *,
+            diagnostics_dir: Path,
+            state_store: PullStateStore,
+            downloaded_count: int,
+            failed_count: int,
+            failure_media_ids: list[str],
+            progress: PullProgressDisplay,
+            enrichment_queue: asyncio.Queue[object] | None,
+        ) -> tuple[int, int]:
+            del current_pending, diagnostics_dir, state_store, failure_media_ids, progress
+            observed_enrichment_queues.append(enrichment_queue)
+            return downloaded_count + 1, failed_count
+
+        context = _FakeLimitedContext(limit=2)
+        other_metadata = MediaMetadata(media_id="media-2", filename="file-2")
+        with (
+            patch(
+                "gphoto_pull.automation._start_download_candidate_async",
+                return_value=pending_download,
+            ),
+            patch(
+                "gphoto_pull.automation._finalize_pending_download_async",
+                side_effect=fake_finalize,
+            ),
+        ):
+            summary = asyncio.run(
+                _download_candidates_async(
+                    cast("BrowserContext", context),
+                    diagnostics_dir=Path("tmp-diagnostics"),
+                    download_dir=Path("tmp-downloads"),
+                    state_store=cast(PullStateStore, SimpleNamespace()),
+                    photos_ui=cast(GooglePhotosUi, SimpleNamespace()),
+                    queued_candidates=[
+                        (metadata, MediaStateRecord(metadata=metadata)),
+                        (other_metadata, MediaStateRecord(metadata=other_metadata)),
+                    ],
+                    download_concurrency=2,
+                    enrichment_concurrency=5,
+                    enrich_metadata=True,
+                )
+            )
+
+        self.assertEqual(summary.downloaded_count, 2)
+        self.assertEqual(summary.failed_count, 0)
+        self.assertEqual(observed_enrichment_queues, [None, None])
+        self.assertEqual(context.calls, 3)
+
+    def test_download_candidates_closes_progress_when_page_startup_fails(self) -> None:
+        metadata = MediaMetadata(media_id="media-1", filename="file-1")
+        context = _FakeLimitedContext(limit=0)
+
+        with (
+            patch("gphoto_pull.automation.PullProgressDisplay.close") as close_progress,
+            self.assertRaises(RuntimeError),
+        ):
+            asyncio.run(
+                _download_candidates_async(
+                    cast("BrowserContext", context),
+                    diagnostics_dir=Path("tmp-diagnostics"),
+                    download_dir=Path("tmp-downloads"),
+                    state_store=cast(PullStateStore, SimpleNamespace()),
+                    photos_ui=cast(GooglePhotosUi, SimpleNamespace()),
+                    queued_candidates=[(metadata, MediaStateRecord(metadata=metadata))],
+                    download_concurrency=1,
+                    enrichment_concurrency=1,
+                    enrich_metadata=True,
+                    progress_interactive=False,
+                )
+            )
+
+        close_progress.assert_called_once_with()
+        self.assertEqual(context.calls, 1)
 
     def test_finalize_writes_canonical_product_url_for_index_only_download(self) -> None:
         metadata = MediaMetadata(media_id="AF1QipNoUrl", filename="original.mp4")
@@ -482,6 +846,7 @@ class DownloadTraceTests(unittest.TestCase):
                 stream=StringIO(),
                 interactive=False,
             )
+            enrichment_queue: asyncio.Queue[_EnrichmentJob] = asyncio.Queue()
 
             downloaded_count, failed_count = asyncio.run(
                 _finalize_pending_download_async(
@@ -492,21 +857,81 @@ class DownloadTraceTests(unittest.TestCase):
                     failed_count=0,
                     failure_media_ids=[],
                     progress=progress,
+                    enrichment_queue=enrichment_queue,
                 )
             )
             indexed = store.get_media(metadata.media_id)
-            sidecar = json.loads(
-                final_path.with_name("original.mp4.supplemental-metadata.json").read_text(
-                    encoding="utf-8"
-                )
+            sidecar = msgspec.json.decode(
+                final_path.with_name("original.mp4.supplemental-metadata.json").read_bytes(),
+                type=TakeoutSidecar,
             )
+            enrichment_job = enrichment_queue.get_nowait()
 
         self.assertEqual(downloaded_count, 1)
         self.assertEqual(failed_count, 0)
-        self.assertEqual(sidecar["url"], "https://photos.google.com/photo/AF1QipNoUrl")
+        self.assertEqual(enrichment_job.metadata.media_id, metadata.media_id)
+        self.assertEqual(sidecar.url, "https://photos.google.com/photo/AF1QipNoUrl")
         self.assertIsNotNone(indexed)
         assert indexed is not None
         self.assertEqual(indexed.metadata.product_url, "https://photos.google.com/photo/AF1QipNoUrl")
+
+    def test_finalize_can_skip_post_download_metadata_enrichment(self) -> None:
+        metadata = MediaMetadata(media_id="AF1QipNoEnrich", filename="original.mp4")
+
+        with (
+            TemporaryDirectory() as tmp_dir,
+            PullStateStore(Path(tmp_dir) / "index.sqlite3") as store,
+            patch("gphoto_pull.automation._enrich_detail_metadata_after_download_async") as enrich,
+        ):
+            download_root = Path(tmp_dir) / "downloads"
+            final_path = download_root / "uploaded" / "unknown-date" / "original.mp4"
+            pending = _PendingDownload(
+                slot=0,
+                page=cast("Page", SimpleNamespace()),
+                record=MediaStateRecord(metadata=metadata),
+                metadata=metadata,
+                plan=DownloadPlan(
+                    media_id=metadata.media_id,
+                    original_filename=metadata.filename,
+                    final_filename=metadata.filename,
+                    final_path=final_path,
+                    relative_path=final_path.relative_to(download_root),
+                ),
+                download=cast("Download", _FakePlaywrightDownload(b"video-bytes")),
+                download_trace=DownloadTrace(content_length=11),
+                detail_metadata=None,
+                queued_at=0.0,
+                start_begin_at=0.0,
+                download_event_at=0.0,
+            )
+            progress = PullProgressDisplay(
+                total_items=1,
+                stream=StringIO(),
+                interactive=False,
+            )
+            progress_stream = cast(StringIO, progress.stream)
+
+            downloaded_count, failed_count = asyncio.run(
+                _finalize_pending_download_async(
+                    pending,
+                    diagnostics_dir=Path(tmp_dir) / "diagnostics",
+                    state_store=store,
+                    downloaded_count=0,
+                    failed_count=0,
+                    failure_media_ids=[],
+                    progress=progress,
+                    enrichment_queue=None,
+                )
+            )
+            sidecar_path = final_path.with_name("original.mp4.supplemental-metadata.json")
+            sidecar_exists = sidecar_path.exists()
+            progress_output = progress_stream.getvalue()
+
+        self.assertEqual(downloaded_count, 1)
+        self.assertEqual(failed_count, 0)
+        enrich.assert_not_called()
+        self.assertTrue(sidecar_exists)
+        self.assertNotIn("enrich: original.mp4", progress_output)
 
     def test_start_download_candidate_retries_after_transient_download_error(self) -> None:
         page = _FakePage()
@@ -628,5 +1053,7 @@ class DownloadTraceTests(unittest.TestCase):
                     photos_ui=cast(GooglePhotosUi, SimpleNamespace()),
                     queued_candidates=[(metadata, record)],
                     download_concurrency=1,
+                    enrichment_concurrency=1,
+                    enrich_metadata=True,
                 )
             )

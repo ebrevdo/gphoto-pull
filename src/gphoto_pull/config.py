@@ -42,12 +42,14 @@ class ConfigOverrides:
         before: Optional exclusive upper-bound timestamp as text or an aware `datetime`.
         download_dir: Optional output directory override.
         download_concurrency: Optional parallel download worker count.
+        enrichment_concurrency: Optional parallel enrichment worker count.
         sync_db_path: Optional SQLite state database path.
         diagnostics_dir: Optional diagnostics artifact directory.
         browsers_path: Optional Playwright browser-install directory.
         browser_binary: Optional Chromium executable path.
         browser_profile_dir: Optional persistent browser profile directory.
         headless: Optional default browser visibility for pull runs.
+        enrich_metadata: Optional post-download detail metadata enrichment setting.
         progress_interactive: Optional override for Rich live progress rendering.
     """
 
@@ -55,12 +57,14 @@ class ConfigOverrides:
     before: str | datetime | None = None
     download_dir: Path | str | None = None
     download_concurrency: int | None = None
+    enrichment_concurrency: int | None = None
     sync_db_path: Path | str | None = None
     diagnostics_dir: Path | str | None = None
     browsers_path: Path | str | None = None
     browser_binary: str | None = None
     browser_profile_dir: Path | str | None = None
     headless: bool | None = None
+    enrich_metadata: bool | None = None
     progress_interactive: bool | None = None
 
 
@@ -76,24 +80,28 @@ class ConfigFile(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
         before: Optional default exclusive upper-bound timestamp as text.
         download_dir: Optional output directory.
         download_concurrency: Optional parallel download worker count.
+        enrichment_concurrency: Optional parallel enrichment worker count.
         sync_db_path: Optional SQLite state database path.
         diagnostics_dir: Optional diagnostics artifact directory.
         browsers_path: Optional Playwright browser-install directory.
         browser_binary: Optional Chromium executable path.
         browser_profile_dir: Optional persistent browser profile directory.
         headless: Optional default browser visibility for pull runs.
+        enrich_metadata: Optional post-download detail metadata enrichment setting.
     """
 
     after: str | None = None
     before: str | None = None
     download_dir: str | None = None
     download_concurrency: int | None = None
+    enrichment_concurrency: int | None = None
     sync_db_path: str | None = None
     diagnostics_dir: str | None = None
     browsers_path: str | None = None
     browser_binary: str | None = None
     browser_profile_dir: str | None = None
     headless: bool | None = None
+    enrich_metadata: bool | None = None
 
 
 def _parse_datetime_field(
@@ -309,6 +317,11 @@ def _apply_overrides(values: ConfigFile, overrides: ConfigOverrides | None) -> C
             if overrides.download_concurrency is not None
             else values.download_concurrency
         ),
+        enrichment_concurrency=(
+            overrides.enrichment_concurrency
+            if overrides.enrichment_concurrency is not None
+            else values.enrichment_concurrency
+        ),
         sync_db_path=(
             str(overrides.sync_db_path)
             if overrides.sync_db_path is not None
@@ -335,6 +348,11 @@ def _apply_overrides(values: ConfigFile, overrides: ConfigOverrides | None) -> C
             else values.browser_profile_dir
         ),
         headless=overrides.headless if overrides.headless is not None else values.headless,
+        enrich_metadata=(
+            overrides.enrich_metadata
+            if overrides.enrich_metadata is not None
+            else values.enrich_metadata
+        ),
     )
 
 
@@ -371,12 +389,15 @@ class ProjectConfig:
         before: Optional aware exclusive upper-bound timestamp.
         download_dir: Final download directory.
         download_concurrency: Number of concurrent download workers.
+        enrichment_concurrency: Number of concurrent metadata enrichment workers.
         sync_db_path: SQLite state database path.
         diagnostics_dir: Diagnostics artifact directory.
         browsers_path: Playwright browser-install directory.
         browser_binary: Optional Chromium executable path.
         browser_profile_dir: Persistent Google login profile directory.
         headless: Whether pull runs should hide the browser by default.
+        enrich_metadata: Whether pull runs should fetch detail metadata after
+            direct downloads.
         progress_interactive: Whether pull progress may use Rich live rendering.
         config_file: TOML file path considered for this run.
         config_file_loaded: Whether `config_file` existed and was decoded.
@@ -387,12 +408,14 @@ class ProjectConfig:
     before: datetime | None
     download_dir: Path
     download_concurrency: int
+    enrichment_concurrency: int
     sync_db_path: Path
     diagnostics_dir: Path
     browsers_path: Path
     browser_binary: str | None
     browser_profile_dir: Path
     headless: bool
+    enrich_metadata: bool
     progress_interactive: bool
     config_file: Path
     config_file_loaded: bool
@@ -434,7 +457,10 @@ class ProjectConfig:
         else:
             config_file = Path(config_path).expanduser()
             if not config_file.is_absolute():
-                config_file = resolved_config_dir / config_file
+                config_file = _resolve_config_file_path(
+                    config_file,
+                    config_dir=resolved_config_dir,
+                )
         config_values = _read_config_file(config_file)
         download_source = _download_path_source(config_values, overrides)
         values = _apply_overrides(config_values, overrides)
@@ -451,8 +477,13 @@ class ProjectConfig:
             download_dir=download_dir,
             download_concurrency=_parse_positive_int(
                 values.download_concurrency,
-                default=4,
+                default=3,
                 field_name="download_concurrency",
+            ),
+            enrichment_concurrency=_parse_positive_int(
+                values.enrichment_concurrency,
+                default=5,
+                field_name="enrichment_concurrency",
             ),
             sync_db_path=_parse_path(
                 values.sync_db_path,
@@ -482,6 +513,7 @@ class ProjectConfig:
                 base_dir=resolved_config_dir,
             ),
             headless=True if values.headless is None else values.headless,
+            enrich_metadata=True if values.enrich_metadata is None else values.enrich_metadata,
             progress_interactive=(
                 True
                 if overrides is None or overrides.progress_interactive is None
@@ -504,3 +536,20 @@ class ProjectConfig:
         self.diagnostics_dir.mkdir(parents=True, exist_ok=True)
         self.browsers_path.mkdir(parents=True, exist_ok=True)
         self.browser_profile_dir.mkdir(parents=True, exist_ok=True)
+
+
+def _resolve_config_file_path(config_path: Path, *, config_dir: Path) -> Path:
+    """Description:
+    Resolve a relative config path without duplicating an existing directory prefix.
+
+    Args:
+        config_path: Relative config file path.
+        config_dir: Effective config directory.
+
+    Returns:
+        Relative path resolved under `config_dir` when needed.
+    """
+
+    if config_path.parts[: len(config_dir.parts)] == config_dir.parts:
+        return config_path
+    return config_dir / config_path

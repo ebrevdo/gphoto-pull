@@ -12,6 +12,7 @@ from pathlib import Path
 
 import msgspec
 import msgspec.json
+
 from gphoto_pull.detail_payloads import DetailMetadata
 from gphoto_pull.models import MediaMetadata
 
@@ -42,15 +43,15 @@ class TakeoutGeoData(msgspec.Struct, frozen=True):
         latitude: Latitude in decimal degrees.
         longitude: Longitude in decimal degrees.
         altitude: Altitude in meters.
-        latitudeSpan: Viewport latitude span.
-        longitudeSpan: Viewport longitude span.
+        latitude_span: Viewport latitude span, encoded as `latitudeSpan`.
+        longitude_span: Viewport longitude span, encoded as `longitudeSpan`.
     """
 
     latitude: float
     longitude: float
     altitude: float
-    latitudeSpan: float
-    longitudeSpan: float
+    latitude_span: float = msgspec.field(name="latitudeSpan")
+    longitude_span: float = msgspec.field(name="longitudeSpan")
 
 
 class TakeoutPerson(msgspec.Struct, frozen=True):
@@ -75,20 +76,20 @@ class TakeoutSidecar(msgspec.Struct, frozen=True, omit_defaults=True):
     Attributes:
         title: Final media filename.
         description: Google Photos description or an empty string.
-        imageViews: Google Takeout image-views field.
-        creationTime: Upload/add timestamp.
-        photoTakenTime: Capture timestamp.
-        geoData: Cloud-side geodata when known.
+        image_views: Google Takeout image-views field, encoded as `imageViews`.
+        creation_time: Upload/add timestamp, encoded as `creationTime`.
+        photo_taken_time: Capture timestamp, encoded as `photoTakenTime`.
+        geo_data: Cloud-side geodata when known, encoded as `geoData`.
         people: People labels when known.
         url: Google Photos detail URL when known.
     """
 
     title: str
     description: str
-    imageViews: str
-    creationTime: TakeoutTime
-    photoTakenTime: TakeoutTime
-    geoData: TakeoutGeoData | None = None
+    image_views: str = msgspec.field(name="imageViews")
+    creation_time: TakeoutTime = msgspec.field(name="creationTime")
+    photo_taken_time: TakeoutTime = msgspec.field(name="photoTakenTime")
+    geo_data: TakeoutGeoData | None = msgspec.field(default=None, name="geoData")
     people: tuple[TakeoutPerson, ...] = ()
     url: str | None = None
 
@@ -140,18 +141,18 @@ def _takeout_metadata(
             latitude=detail.geo_data.latitude,
             longitude=detail.geo_data.longitude,
             altitude=detail.geo_data.altitude,
-            latitudeSpan=0.0,
-            longitudeSpan=0.0,
+            latitude_span=0.0,
+            longitude_span=0.0,
         )
     return TakeoutSidecar(
         title=metadata.filename,
         description="" if detail is None or detail.description is None else detail.description,
-        imageViews="0",
-        creationTime=_takeout_time(metadata.uploaded_time),
-        photoTakenTime=_takeout_time(
+        image_views="0",
+        creation_time=_takeout_time(metadata.uploaded_time),
+        photo_taken_time=_takeout_time(
             detail.photo_taken_time if detail is not None else metadata.capture_time
         ),
-        geoData=geo_data,
+        geo_data=geo_data,
         people=() if detail is None else tuple(TakeoutPerson(name=name) for name in detail.people),
         url=metadata.product_url,
     )

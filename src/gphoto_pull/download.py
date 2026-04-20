@@ -107,9 +107,9 @@ def plan_download_target(
     metadata = media.metadata if isinstance(media, MediaStateRecord) else media
     original_filename = metadata.filename
 
-    sanitized_name = _sanitize_filename(original_filename)
-    target_dir = download_root / _uploaded_date_directory(metadata)
-    primary_path = target_dir / sanitized_name
+    primary_path = primary_download_path(download_root, metadata)
+    sanitized_name = primary_path.name
+    target_dir = primary_path.parent
     if not primary_path.exists():
         relative_path = primary_path.relative_to(download_root)
         return DownloadPlan(
@@ -153,6 +153,30 @@ def plan_download_target(
                 used_media_id_suffix=True,
             )
         probe += 1
+
+
+def primary_download_path(
+    download_dir: Path | str,
+    media: MediaMetadata | MediaStateRecord,
+) -> Path:
+    """Description:
+    Build the primary non-collision target path for a media item.
+
+    Args:
+        download_dir: Root directory for finalized downloads.
+        media: Metadata or a persisted state record to plan for.
+
+    Returns:
+        Primary target path before collision suffixing.
+    """
+
+    download_root = Path(download_dir)
+    metadata = media.metadata if isinstance(media, MediaStateRecord) else media
+    return (
+        download_root
+        / _uploaded_date_directory(metadata)
+        / _sanitize_filename(metadata.filename)
+    )
 
 
 def create_staging_path(plan: DownloadPlan, *, suffix: str = ".part") -> Path:

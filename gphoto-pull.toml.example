@@ -3,12 +3,14 @@
 
 # Omit this to download into the current working directory.
 # download_dir = "downloads"
-download_concurrency = 4
+download_concurrency = 3
+enrichment_concurrency = 5
 sync_db_path = "state/pull-state.sqlite3"
 diagnostics_dir = "diagnostics"
 browsers_path = "browsers"
 browser_profile_dir = "chrome-profile"
 headless = true
+enrich_metadata = true
 
 # Prefer passing --after/--before per run unless you always want the same window.
 # Missing time defaults to midnight; missing timezone defaults to local timezone.

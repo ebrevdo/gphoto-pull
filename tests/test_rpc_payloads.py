@@ -2,6 +2,7 @@ import unittest
 from pathlib import Path
 
 import msgspec.json
+
 from gphoto_pull.rpc_payloads import (
     JsonValue,
     extract_init_data_requests,

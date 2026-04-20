@@ -30,8 +30,9 @@ class PullProgressTests(unittest.TestCase):
         self.assertIn("1/1 ok=0 fail=1", rendered)
 
     def test_recent_row_limit_uses_available_terminal_height(self) -> None:
-        self.assertEqual(recent_row_limit(console_height=20, active_rows=4), 4)
+        self.assertEqual(recent_row_limit(console_height=20, active_rows=4), 2)
         self.assertEqual(recent_row_limit(console_height=80, active_rows=4), 50)
+        self.assertEqual(recent_row_limit(console_height=12, active_rows=8), 0)
 
 
 class PullProgressDisplayTests(unittest.TestCase):

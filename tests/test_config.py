@@ -1,3 +1,4 @@
+import os
 import unittest
 from datetime import datetime
 from pathlib import Path
@@ -18,12 +19,14 @@ class ProjectConfigTests(unittest.TestCase):
                         'before = "2026-01-03T03:04:05-08:00"',
                         f'download_dir = "{Path("~/gphoto-pull-archive")}"',
                         "download_concurrency = 6",
+                        "enrichment_concurrency = 9",
                         'sync_db_path = "tmp/pull-state.sqlite3"',
                         'diagnostics_dir = "tmp/diagnostics"',
                         'browsers_path = "tmp/playwright"',
                         'browser_binary = "custom-chromium"',
                         'browser_profile_dir = "~/profiles/gphoto-pull"',
                         "headless = false",
+                        "enrich_metadata = false",
                     ]
                 ),
                 encoding="utf-8",
@@ -38,6 +41,7 @@ class ProjectConfigTests(unittest.TestCase):
             self.assertEqual(config.config_dir, config_path.parent)
             self.assertEqual(config.download_dir, Path("~/gphoto-pull-archive").expanduser())
             self.assertEqual(config.download_concurrency, 6)
+            self.assertEqual(config.enrichment_concurrency, 9)
             self.assertEqual(config.sync_db_path, config_path.parent / "tmp/pull-state.sqlite3")
             self.assertEqual(config.diagnostics_dir, config_path.parent / "tmp/diagnostics")
             self.assertEqual(config.browsers_path, config_path.parent / "tmp/playwright")
@@ -47,6 +51,7 @@ class ProjectConfigTests(unittest.TestCase):
                 Path("~/profiles/gphoto-pull").expanduser(),
             )
             self.assertFalse(config.headless)
+            self.assertFalse(config.enrich_metadata)
             self.assertTrue(config.config_file_loaded)
 
             browser_paths = BrowserSessionPaths(
@@ -84,7 +89,9 @@ class ProjectConfigTests(unittest.TestCase):
                     before="2026-02-04T04:05:06-08:00",
                     download_dir="override-downloads",
                     download_concurrency=8,
+                    enrichment_concurrency=10,
                     headless=False,
+                    enrich_metadata=False,
                 ),
             )
 
@@ -94,7 +101,9 @@ class ProjectConfigTests(unittest.TestCase):
             self.assertEqual(config.before.isoformat(), "2026-02-04T04:05:06-08:00")
             self.assertEqual(config.download_dir, Path.cwd() / "override-downloads")
             self.assertEqual(config.download_concurrency, 8)
+            self.assertEqual(config.enrichment_concurrency, 10)
             self.assertFalse(config.headless)
+            self.assertFalse(config.enrich_metadata)
 
     def test_from_sources_uses_current_year_for_dates_without_year(self) -> None:
         config = ProjectConfig.from_sources(
@@ -124,13 +133,15 @@ class ProjectConfigTests(unittest.TestCase):
             with self.assertRaisesRegex(ConfigError, "download_dir.*absolute"):
                 ProjectConfig.from_sources(config_path=config_path)
 
-    def test_from_sources_defaults_download_concurrency_to_four(self) -> None:
+    def test_from_sources_defaults_worker_concurrency(self) -> None:
         with TemporaryDirectory() as tmp_dir:
             config_dir = Path(tmp_dir)
             config = ProjectConfig.from_sources(config_dir=config_dir)
 
-            self.assertEqual(config.download_concurrency, 4)
+            self.assertEqual(config.download_concurrency, 3)
+            self.assertEqual(config.enrichment_concurrency, 5)
             self.assertTrue(config.headless)
+            self.assertTrue(config.enrich_metadata)
             self.assertEqual(config.download_dir, Path.cwd())
             self.assertEqual(config.sync_db_path, config_dir / "state/pull-state.sqlite3")
             self.assertEqual(config.diagnostics_dir, config_dir / "diagnostics")
@@ -178,3 +189,21 @@ class ProjectConfigTests(unittest.TestCase):
             self.assertEqual(config.diagnostics_dir, config_dir / "tmp/diagnostics")
             self.assertEqual(config.browsers_path, config_dir / "tmp/playwright")
             self.assertEqual(config.browser_profile_dir, config_dir / "tmp/chrome-profile")
+
+    def test_from_sources_uses_relative_config_path_once(self) -> None:
+        original_cwd = Path.cwd()
+        with TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            config_path = root / "configs" / "dev.toml"
+            config_path.parent.mkdir()
+            config_path.write_text('sync_db_path = "state.sqlite3"\n', encoding="utf-8")
+
+            try:
+                os.chdir(root)
+                config = ProjectConfig.from_sources(config_path=Path("configs/dev.toml"))
+            finally:
+                os.chdir(original_cwd)
+
+        self.assertEqual(config.config_file, Path("configs/dev.toml"))
+        self.assertTrue(config.config_file_loaded)
+        self.assertEqual(config.sync_db_path, Path("configs/state.sqlite3"))
