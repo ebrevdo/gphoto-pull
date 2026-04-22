@@ -28,7 +28,7 @@ dependencies = [
     "playwright>=1.52",
     "python-dateutil>=2.9.0.post0",
     "rich>=15.0.0",
-    "tyro>=1.0.12",
+    "tyro>=1.0.13",
 ]
 
 [project.scripts]
