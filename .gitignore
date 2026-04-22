@@ -18,3 +18,5 @@ build/
 htmlcov/
 playwright-report/
 test-results/
+tmp/
+uploaded/
