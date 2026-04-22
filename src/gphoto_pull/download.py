@@ -18,7 +18,7 @@ from pathlib import Path
 
 from gphoto_pull.models import MediaMetadata, MediaStateRecord
 
-_INVALID_FILENAME_CHARS = str.maketrans({character: "_" for character in '<>:"/\\|?*'})
+_INVALID_FILENAME_CHARS = str.maketrans(dict.fromkeys('<>:"/\\|?*', "_"))
 _CONTROL_CHARACTERS = re.compile(r"[\x00-\x1f]")
 _MEDIA_ID_SLUG = re.compile(r"[^A-Za-z0-9]+")
 _WINDOWS_RESERVED_NAMES = {
@@ -173,9 +173,7 @@ def primary_download_path(
     download_root = Path(download_dir)
     metadata = media.metadata if isinstance(media, MediaStateRecord) else media
     return (
-        download_root
-        / _uploaded_date_directory(metadata)
-        / _sanitize_filename(metadata.filename)
+        download_root / _uploaded_date_directory(metadata) / _sanitize_filename(metadata.filename)
     )
 
 

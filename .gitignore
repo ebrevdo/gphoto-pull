@@ -1,6 +1,7 @@
 photo-pull.toml
 .photo-pull/
 .codex
+.codex/
 .venv/
 .mypy_cache/
 .pytest_cache/

@@ -2026,9 +2026,7 @@ def _recent_page_form_request(cursor: str, *, rpc_id: str) -> str:
         ),
     )
     inner: list[JsonValue] = [None, None, cursor, None, None, None, 1, filter_shape]
-    outer: list[JsonValue] = [
-        [[rpc_id, msgspec.json.encode(inner).decode(), None, "generic"]]
-    ]
+    outer: list[JsonValue] = [[[rpc_id, msgspec.json.encode(inner).decode(), None, "generic"]]]
     return msgspec.json.encode(outer).decode()
 
 

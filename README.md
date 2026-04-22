@@ -1,5 +1,10 @@
 # gphoto-pull
 
+[![CI](https://github.com/ebrevdo/gphoto-pull/actions/workflows/ci.yml/badge.svg)](https://github.com/ebrevdo/gphoto-pull/actions/workflows/ci.yml)
+[![PyPI](https://img.shields.io/pypi/v/gphoto-pull.svg)](https://pypi.org/project/gphoto-pull/)
+[![Python](https://img.shields.io/pypi/pyversions/gphoto-pull.svg)](https://pypi.org/project/gphoto-pull/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 `gphoto-pull` is a Python CLI for downloading original Google Photos photos and videos
 uploaded or shared inside a date/time window. It uses Playwright with an app-owned persistent
 Chromium profile, so the normal flow is manual Google login once and headless pulls after that.
@@ -8,7 +13,21 @@ Google Photos is not a stable public API. This project treats the browser sessio
 files, diagnostics, and sync database as local runtime state and keeps enough diagnostics to debug
 site drift.
 
-## Quick Start
+## Install
+
+Install from PyPI after the first release:
+
+```bash
+pipx install gphoto-pull
+```
+
+Until then, install directly from GitHub:
+
+```bash
+pipx install git+https://github.com/ebrevdo/gphoto-pull.git
+```
+
+## First Run
 
 ```bash
 gphoto-pull config --defaults
@@ -121,7 +140,7 @@ separate worker pool controlled by `enrichment_concurrency`.
 
 ## Troubleshooting
 
-- If `doctor` reports missing browser binaries, run the Playwright install command from Quick Start.
+- If `doctor` reports missing browser binaries, run `gphoto-pull install-browser`.
 - If `pull` lands on a Google marketing page or account chooser, run `gphoto-pull login` again.
 - If `login` crashes because the browser profile is stale or locked, run `gphoto-pull reset --yes`.
 - If downloads fail, inspect `diagnostics/pull_failures/` and `diagnostics/download_traces/`.
@@ -131,15 +150,35 @@ separate worker pool controlled by `enrichment_concurrency`.
 
 ## Development
 
+Install `just`, or use the direct `uv run ...` commands in `CONTRIBUTING.md`.
+
 ```bash
 uv sync --dev
 uv run gphoto-pull --help
-uv run ruff check .
-uv run ruff format .
-uv run pyright
-uv run python -m unittest discover -s tests
-uv build
+just --list
+just lint
+just test
+just check
 ```
+
+CI runs the same checks on pushes to `main`, pull requests, and manual dispatches:
+Ruff format, Ruff lint, Pyright, unit tests, and `uv build`. The same local commands are
+available in `justfile`; CI keeps the underlying uv commands expanded so the workflow does not
+need to install `just`.
+
+To prepare a release:
+
+```bash
+uv sync --dev
+just publish-dry-run
+```
+
+Publishing from GitHub uses PyPI Trusted Publishing through `.github/workflows/release.yml`.
+Configure the PyPI project publisher for this repository, workflow filename `release.yml`, and
+GitHub environment `pypi`. Release tags use a `v` prefix, starting with `v0.0.1`. After PyPI is
+configured, publishing is tokenless: publish a GitHub release or run the Release workflow manually,
+and the workflow will build, test, and run
+`uv publish --trusted-publishing always dist/*`.
 
 The source uses a `src/` layout. Main modules are:
 

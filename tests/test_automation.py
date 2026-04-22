@@ -377,7 +377,9 @@ class DownloadTraceTests(unittest.TestCase):
 
         self.assertIsNotNone(record)
         assert record is not None
-        self.assertEqual(record.metadata.product_url, "https://photos.google.com/photo/AF1QipCaptured")
+        self.assertEqual(
+            record.metadata.product_url, "https://photos.google.com/photo/AF1QipCaptured"
+        )
         self.assertTrue(covered)
 
     def test_wait_for_detail_metadata_response_returns_none_after_timeout(self) -> None:
@@ -426,6 +428,7 @@ class DownloadTraceTests(unittest.TestCase):
     def test_close_response_capture_can_cancel_without_draining(self) -> None:
         async def run() -> tuple[bool, bool]:
             event = asyncio.Event()
+
             async def wait_forever() -> None:
                 await event.wait()
 
@@ -873,7 +876,9 @@ class DownloadTraceTests(unittest.TestCase):
         self.assertEqual(sidecar.url, "https://photos.google.com/photo/AF1QipNoUrl")
         self.assertIsNotNone(indexed)
         assert indexed is not None
-        self.assertEqual(indexed.metadata.product_url, "https://photos.google.com/photo/AF1QipNoUrl")
+        self.assertEqual(
+            indexed.metadata.product_url, "https://photos.google.com/photo/AF1QipNoUrl"
+        )
 
     def test_finalize_can_skip_post_download_metadata_enrichment(self) -> None:
         metadata = MediaMetadata(media_id="AF1QipNoEnrich", filename="original.mp4")

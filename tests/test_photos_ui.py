@@ -96,5 +96,6 @@ class GooglePhotosUiTests(unittest.TestCase):
         with self.assertRaisesRegex(PhotosUiError, "More options"):
             ui.open_download_menu(cast("Page", page))
 
+
 if __name__ == "__main__":
     unittest.main()
