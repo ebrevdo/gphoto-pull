@@ -192,6 +192,7 @@ class BrowserSessionPathsTests(unittest.TestCase):
             process = _FakeLoginProcess(running=True)
 
             with (
+                patch("gphoto_pull.browser.os.geteuid", return_value=1000),
                 patch("gphoto_pull.browser.subprocess.Popen", return_value=process) as popen,
                 patch("builtins.input", return_value=""),
                 patch("builtins.print"),
@@ -205,6 +206,7 @@ class BrowserSessionPathsTests(unittest.TestCase):
             self.assertIn(f"--user-data-dir={paths.profile_dir}", command)
             self.assertIn("--new-window", command)
             self.assertIn("--allow-browser-signin=false", command)
+            self.assertNotIn("--no-sandbox", command)
             self.assertIn("--password-store=basic", command)
             self.assertIn("--use-mock-keychain", command)
             process.terminate.assert_called_once_with()
@@ -232,6 +234,7 @@ class BrowserSessionPathsTests(unittest.TestCase):
             process = _FakeLoginProcess(running=False)
 
             with (
+                patch("gphoto_pull.browser.os.geteuid", return_value=1000),
                 patch("gphoto_pull.browser.subprocess.Popen", return_value=process) as popen,
                 patch("builtins.input", return_value=""),
                 patch("builtins.print"),
@@ -242,6 +245,31 @@ class BrowserSessionPathsTests(unittest.TestCase):
             self.assertEqual(command[-1], "https://accounts.google.com/custom")
             process.terminate.assert_not_called()
             process.wait.assert_not_called()
+
+    def test_interactive_login_disables_sandbox_when_running_as_root(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            paths = BrowserSessionPaths(
+                download_dir=root / "downloads",
+                profile_dir=root / "chrome-profile",
+                browsers_path=root / ".playwright",
+            )
+            self._install_fake_chromium(paths)
+            self._install_fake_playwright(
+                executable_path=paths.browsers_path / "fake-platform" / "chromium"
+            )
+            process = _FakeLoginProcess(running=False)
+
+            with (
+                patch("gphoto_pull.browser.os.geteuid", return_value=0),
+                patch("gphoto_pull.browser.subprocess.Popen", return_value=process) as popen,
+                patch("builtins.input", return_value=""),
+                patch("builtins.print"),
+            ):
+                interactive_login(paths)
+
+            command = popen.call_args.args[0]
+            self.assertIn("--no-sandbox", command)
 
     def test_persistent_context_disables_browser_signin(self) -> None:
         class AsyncChromium:
@@ -258,18 +286,50 @@ class BrowserSessionPathsTests(unittest.TestCase):
             chromium = AsyncChromium()
             playwright = SimpleNamespace(chromium=chromium)
 
-            result = asyncio.run(
-                _launch_persistent_context_async(
-                    cast("AsyncPlaywright", playwright),
-                    paths,
-                    headless=True,
-                    browser_binary=None,
+            with patch("gphoto_pull.browser.os.geteuid", return_value=1000):
+                result = asyncio.run(
+                    _launch_persistent_context_async(
+                        cast("AsyncPlaywright", playwright),
+                        paths,
+                        headless=True,
+                        browser_binary=None,
+                    )
                 )
+
+            self.assertIsNotNone(result)
+            chromium.launch_persistent_context.assert_called_once()
+            args = chromium.launch_persistent_context.call_args.kwargs["args"]
+            self.assertIn("--allow-browser-signin=false", args)
+            self.assertNotIn("--no-sandbox", args)
+
+    def test_persistent_context_disables_sandbox_when_running_as_root(self) -> None:
+        class AsyncChromium:
+            def __init__(self) -> None:
+                self.launch_persistent_context = AsyncMock(return_value=object())
+
+        with TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            paths = BrowserSessionPaths(
+                download_dir=root / "downloads",
+                profile_dir=root / "chrome-profile",
+                browsers_path=root / ".playwright",
             )
+            chromium = AsyncChromium()
+            playwright = SimpleNamespace(chromium=chromium)
+
+            with patch("gphoto_pull.browser.os.geteuid", return_value=0):
+                result = asyncio.run(
+                    _launch_persistent_context_async(
+                        cast("AsyncPlaywright", playwright),
+                        paths,
+                        headless=True,
+                        browser_binary=None,
+                    )
+                )
 
             self.assertIsNotNone(result)
             chromium.launch_persistent_context.assert_called_once()
             self.assertIn(
-                "--allow-browser-signin=false",
+                "--no-sandbox",
                 chromium.launch_persistent_context.call_args.kwargs["args"],
             )

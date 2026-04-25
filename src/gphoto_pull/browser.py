@@ -309,6 +309,14 @@ def _process_is_running(pid: int) -> bool:
     return True
 
 
+def _chromium_profile_compat_args() -> list[str]:
+    args: list[str] = list(CHROMIUM_PROFILE_COMPAT_ARGS)
+    if os.geteuid() == 0:
+        # Chromium refuses to start as root unless the sandbox is disabled.
+        args.append("--no-sandbox")
+    return args
+
+
 @contextmanager
 def _playwright_browsers_path(paths: BrowserSessionPaths) -> Iterator[None]:
     """Description:
@@ -432,7 +440,7 @@ async def _launch_persistent_context_async(
                 downloads_path=str(paths.download_dir),
                 handle_sigint=True,
                 executable_path=browser_binary,
-                args=list(CHROMIUM_PROFILE_COMPAT_ARGS),
+                args=_chromium_profile_compat_args(),
             )
 
         return await playwright.chromium.launch_persistent_context(
@@ -441,7 +449,7 @@ async def _launch_persistent_context_async(
             accept_downloads=True,
             downloads_path=str(paths.download_dir),
             handle_sigint=True,
-            args=list(CHROMIUM_PROFILE_COMPAT_ARGS),
+            args=_chromium_profile_compat_args(),
         )
     except PlaywrightError as exc:
         raise BrowserSessionError(str(exc)) from exc
@@ -484,7 +492,7 @@ def interactive_login(
         f"--user-data-dir={paths.profile_dir}",
         "--no-first-run",
         "--new-window",
-        *CHROMIUM_PROFILE_COMPAT_ARGS,
+        *_chromium_profile_compat_args(),
         *LOGIN_PROFILE_COMPAT_ARGS,
         login_start_url,
     ]
