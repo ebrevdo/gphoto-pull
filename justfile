@@ -33,5 +33,5 @@ publish-dry-run: build
     UV_PUBLISH_TOKEN='op://Private/gphoto-pull pypi API token/password' op run -- uv publish --dry-run --trusted-publishing never dist/*
 
 # DANGEROUS
-publish:
+publish: build
     UV_PUBLISH_TOKEN='op://Private/gphoto-pull pypi API token/password' op run -- uv publish --trusted-publishing never dist/*
