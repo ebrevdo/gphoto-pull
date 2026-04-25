@@ -1,5 +1,4 @@
 import unittest
-from pathlib import Path
 
 import msgspec.json
 
@@ -11,8 +10,17 @@ from gphoto_pull.rpc_payloads import (
     parse_updates_payload,
 )
 
-DIAGNOSTICS_DIR = Path(".state/diagnostics")
-LEGACY_UPDATES_PATH = DIAGNOSTICS_DIR / "updates-frGlJf.txt"
+RECENT_SEARCH_TOKEN = "synthetic-recent-token"
+SHARED_CONTAINER_ID = "AF1QipSharedContainer"
+ACTOR_ID = "AF1QipSyntheticActor"
+
+RECENT_HTML = f"""
+<html>
+  <script>'ds:1':{{id:'eNG3nf'}}</script>
+  <a href="https://photos.google.com/search/{RECENT_SEARCH_TOKEN}">Canonical recent route</a>
+  <a href="./search/{RECENT_SEARCH_TOKEN}" aria-label="Recently added">Recently added</a>
+</html>
+"""
 
 
 def _recent_batchexecute_frame(items: list[list[JsonValue]]) -> str:
@@ -22,23 +30,33 @@ def _recent_batchexecute_frame(items: list[list[JsonValue]]) -> str:
     ).decode()
 
 
+def _updates_batchexecute_frame(activities: list[list[JsonValue]]) -> str:
+    payload_text = msgspec.json.encode([None, activities]).decode()
+    return msgspec.json.encode(
+        [["wrb.fr", "opaqueUpdatesRpc", payload_text, None, None, None]]
+    ).decode()
+
+
 class RpcPayloadFixtureTests(unittest.TestCase):
     def test_parse_recently_added_bootstrap_from_saved_html(self) -> None:
-        html = (DIAGNOSTICS_DIR / "recent_probe" / "recent.html").read_text(encoding="utf-8")
-
-        bootstrap = parse_recently_added_bootstrap(html)
-        requests = extract_init_data_requests(html)
+        bootstrap = parse_recently_added_bootstrap(RECENT_HTML)
+        requests = extract_init_data_requests(RECENT_HTML)
 
         self.assertIsNotNone(bootstrap.canonical_search_token)
         self.assertEqual(
             bootstrap.recent_link_href,
-            "./search/Cg5SZWNlbnRseSBhZGRlZCIIEgYKBHICCgAogsisgdcz",
+            f"./search/{RECENT_SEARCH_TOKEN}",
         )
         self.assertIn("eNG3nf", bootstrap.bootstrap_rpc_ids)
         self.assertGreaterEqual(len(requests), 1)
 
     def test_parse_updates_payload_from_saved_response(self) -> None:
-        raw_text = LEGACY_UPDATES_PATH.read_text(encoding="utf-8")
+        raw_text = _updates_batchexecute_frame(
+            [
+                [f"ai:1774100000:opaque:{SHARED_CONTAINER_ID}:{ACTOR_ID}", 1774000000000],
+                [f"h:1774200000:opaque:{SHARED_CONTAINER_ID}:{ACTOR_ID}", 1774100000000],
+            ]
+        )
 
         payload = parse_updates_payload(raw_text)
 
