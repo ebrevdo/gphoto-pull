@@ -1,8 +1,8 @@
 # gphoto-pull
 
 [![CI](https://github.com/ebrevdo/gphoto-pull/actions/workflows/ci.yml/badge.svg)](https://github.com/ebrevdo/gphoto-pull/actions/workflows/ci.yml)
-[![PyPI](https://img.shields.io/pypi/v/gphoto-pull.svg)](https://pypi.org/project/gphoto-pull/)
-[![Python](https://img.shields.io/pypi/pyversions/gphoto-pull.svg)](https://pypi.org/project/gphoto-pull/)
+[![PyPI](https://img.shields.io/pypi/v/gphoto-pull.svg?cacheSeconds=300)](https://pypi.org/project/gphoto-pull/)
+[![Python](https://img.shields.io/pypi/pyversions/gphoto-pull.svg?cacheSeconds=300)](https://pypi.org/project/gphoto-pull/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 `gphoto-pull` is a Python CLI for downloading original Google Photos photos and videos
@@ -21,13 +21,13 @@ database as local runtime state and keeps enough diagnostics to debug site drift
 
 ## Install
 
-Install from PyPI after the first release:
+Install from PyPI:
 
 ```bash
 pipx install gphoto-pull
 ```
 
-Until then, install directly from GitHub:
+Or install directly from GitHub:
 
 ```bash
 pipx install git+https://github.com/ebrevdo/gphoto-pull.git
