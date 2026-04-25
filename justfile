@@ -30,4 +30,8 @@ build: clean-dist
 check: lint test build
 
 publish-dry-run: build
-    uv publish --dry-run --trusted-publishing never dist/*
+    UV_PUBLISH_TOKEN='op://Private/gphoto-pull pypi API token/password' op run -- uv publish --dry-run --trusted-publishing never dist/*
+
+# DANGEROUS
+publish:
+    UV_PUBLISH_TOKEN='op://Private/gphoto-pull pypi API token/password' op run -- uv publish --trusted-publishing never dist/*
