@@ -14,6 +14,12 @@ from unittest.mock import patch
 import msgspec.json
 
 from gphoto_pull.automation import (
+    AccountScope,
+    GooglePhotosPuller,
+    PullExecutionSummary,
+    _account_identity_from_google_account_label,
+    _account_scope_key,
+    _account_scoped_sync_db_path,
     _AsyncResponseCapture,
     _build_download_trace_async,
     _close_response_capture,
@@ -33,6 +39,8 @@ from gphoto_pull.automation import (
     _update_recent_payload_stats,
     _wait_for_detail_metadata_response,
 )
+from gphoto_pull.browser import BrowserSessionError, BrowserSessionPaths
+from gphoto_pull.config import ConfigOverrides, ProjectConfig
 from gphoto_pull.download import DownloadError, DownloadPlan
 from gphoto_pull.models import DownloadTrace, MediaMetadata, MediaStateRecord
 from gphoto_pull.photos_ui import GooglePhotosUi
@@ -238,6 +246,114 @@ def _noop_response_handler(response: object) -> None:
 
 
 class DownloadTraceTests(unittest.TestCase):
+    def test_pull_live_checks_auth_before_using_covered_index(self) -> None:
+        class FakeContextManager:
+            async def __aenter__(self) -> SimpleNamespace:
+                return SimpleNamespace()
+
+            async def __aexit__(
+                self,
+                _exc_type: object,
+                _exc: object,
+                _tb: object,
+            ) -> bool:
+                return False
+
+        class FakeStore:
+            def __enter__(self) -> "FakeStore":
+                events.append("store")
+                return self
+
+            def __exit__(
+                self,
+                _exc_type: object,
+                _exc: object,
+                _tb: object,
+            ) -> bool:
+                return False
+
+            def upload_coverage_satisfies(self, _after: datetime) -> bool:
+                return True
+
+            def list_media_in_upload_window(
+                self,
+                *,
+                after: datetime,
+                before: datetime | None,
+            ) -> list[MediaStateRecord]:
+                _ = after, before
+                return []
+
+        async def fake_auth_check(*_args: object, **_kwargs: object) -> AccountScope:
+            events.append("auth")
+            return AccountScope("account-key")
+
+        async def fake_download_summary(*_args: object, **_kwargs: object) -> PullExecutionSummary:
+            events.append("download")
+            return PullExecutionSummary(
+                queued_count=0,
+                skipped_existing_count=0,
+                downloaded_count=0,
+                failed_count=0,
+                failure_media_ids=(),
+            )
+
+        events: list[str] = []
+        config = ProjectConfig.from_sources(
+            config_path=Path("/missing-gphoto-pull.toml"),
+            overrides=ConfigOverrides(after="2026-01-02T03:04:05-08:00"),
+        )
+        service = GooglePhotosPuller(config)
+        paths = BrowserSessionPaths(
+            download_dir=config.download_dir,
+            profile_dir=config.browser_profile_dir,
+            diagnostics_dir=config.diagnostics_dir,
+            browsers_path=config.browsers_path,
+        )
+
+        with (
+            patch(
+                "gphoto_pull.automation.launched_browser_context_async",
+                return_value=FakeContextManager(),
+            ),
+            patch(
+                "gphoto_pull.automation._assert_authenticated_photos_session_async",
+                fake_auth_check,
+            ),
+            patch("gphoto_pull.automation.PullStateStore", return_value=FakeStore()),
+            patch.object(service, "_download_summary_candidates", fake_download_summary),
+        ):
+            asyncio.run(service._pull_live(paths, []))
+
+        self.assertEqual(events, ["auth", "store", "download"])
+
+    def test_account_scoped_sync_db_path_uses_template_parent_and_name(self) -> None:
+        template = Path("/tmp/gphoto/state/pull-state.sqlite3")
+
+        path = _account_scoped_sync_db_path(template, AccountScope("account-key"))
+
+        self.assertEqual(
+            path,
+            Path("/tmp/gphoto/state/accounts/account-key/pull-state.sqlite3"),
+        )
+
+    def test_account_identity_uses_google_account_aria_label_email(self) -> None:
+        identity = _account_identity_from_google_account_label(
+            "Google Account: Test.User@example.COM"
+        )
+
+        self.assertEqual(identity, "email:test.user@example.com")
+
+    def test_account_identity_rejects_missing_email(self) -> None:
+        with self.assertRaisesRegex(BrowserSessionError, "did not contain an email"):
+            _account_identity_from_google_account_label("Google Account")
+
+    def test_account_scope_key_hashes_identity(self) -> None:
+        key = _account_scope_key("email:test.user@example.com")
+
+        self.assertEqual(len(key), 16)
+        self.assertNotIn("@", key)
+
     def test_recent_payload_cursor_handles_cursor_only_response(self) -> None:
         raw_text = (
             """)]}'\n\n258\n"""
@@ -936,6 +1052,8 @@ class DownloadTraceTests(unittest.TestCase):
         self.assertEqual(failed_count, 0)
         enrich.assert_not_called()
         self.assertTrue(sidecar_exists)
+        self.assertLess(progress_output.index("download:"), progress_output.index("finalize:"))
+        self.assertLess(progress_output.index("finalize:"), progress_output.index("done:"))
         self.assertNotIn("enrich: original.mp4", progress_output)
 
     def test_start_download_candidate_retries_after_transient_download_error(self) -> None:

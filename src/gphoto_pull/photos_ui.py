@@ -7,12 +7,10 @@ Description:
 
 from __future__ import annotations
 
-import re
 from contextlib import suppress
 from dataclasses import dataclass
 from enum import StrEnum
 from html.parser import HTMLParser
-from pathlib import Path
 from typing import TYPE_CHECKING
 from urllib.parse import urljoin, urlparse
 
@@ -25,8 +23,6 @@ PHOTOS_BASE_URL = f"{PHOTOS_APP_ORIGIN}/"
 RECENTLY_ADDED_URL = f"{PHOTOS_APP_ORIGIN}/search/_tra_"
 UPDATES_URL = f"{PHOTOS_APP_ORIGIN}/updates"
 
-_RECENT_GROUP_PATTERN = re.compile(r'<h2 class="ZEmz6b">(Added [^<]+)</h2>')
-_RECENT_ITEM_PATTERN = re.compile(r'href="(\./search/[^"]+/photo/[^"]+)"[^>]*aria-label="([^"]+)"')
 _RECENT_MEDIA_LINK_SELECTOR = (
     'a[href*="/photo/"][aria-label^="Photo - "], a[href*="/photo/"][aria-label^="Video - "]'
 )
@@ -282,70 +278,6 @@ def infer_media_kind(label: str) -> str:
     if prefix == "video":
         return "video"
     return "unknown"
-
-
-def _summarize_recently_added(html: str) -> list[str]:
-    """Description:
-    Summarize saved Recently Added HTML diagnostics.
-
-    Args:
-        html: Recently Added HTML snapshot.
-
-    Returns:
-        Operator-facing summary lines.
-    """
-
-    headings = list(_RECENT_GROUP_PATTERN.finditer(html))
-    if not headings:
-        return ["Saved diagnostics recently added: no saved recent capture found."]
-
-    media_locations = tuple(
-        location
-        for location in extract_photo_locations_from_html(html)
-        if location.media_id is not None
-    )
-    first_group_label = headings[0].group(1)
-    first_group_start = headings[0].end()
-    first_group_end = headings[1].start() if len(headings) > 1 else len(html)
-    first_group_count = len(_RECENT_ITEM_PATTERN.findall(html[first_group_start:first_group_end]))
-
-    return [
-        "Saved diagnostics recently added: "
-        f"{len(media_locations)} media tiles across {len(headings)} groups.",
-        f"Saved diagnostics recent sample: {first_group_label} ({first_group_count} items).",
-    ]
-
-
-def _summarize_updates(html: str) -> list[str]:
-    """Description:
-    Summarize saved Updates HTML diagnostics.
-
-    Args:
-        html: Updates HTML snapshot.
-
-    Returns:
-        Operator-facing summary lines.
-    """
-
-    locations = extract_photo_locations_from_html(html)
-    shared_container_count = sum(
-        location.surface is PhotosSurface.SHARED_ALBUM_DETAIL for location in locations
-    )
-    direct_count = sum(location.surface is PhotosSurface.DIRECT_THREAD for location in locations)
-    preview_count = sum(
-        location.surface is PhotosSurface.SHARED_ALBUM_MEDIA_DETAIL for location in locations
-    )
-    activity_card_count = shared_container_count + direct_count
-
-    return [
-        "Saved updates HTML routes: "
-        f"{shared_container_count + preview_count + direct_count} shared/direct links across "
-        f"{len(locations)} normalized Photos links.",
-        f"Saved diagnostics update previews: {preview_count} preview media ids.",
-        "Saved diagnostics updates: "
-        f"{activity_card_count} activity cards "
-        f"({shared_container_count} shared, {direct_count} direct).",
-    ]
 
 
 class GooglePhotosUi:
@@ -755,47 +687,6 @@ class GooglePhotosUi:
             error_message="Could not find a visible 'Download' action.",
         )
 
-    def dry_run_notes(self, *, diagnostics_dir: Path) -> list[str]:
-        """Description:
-        Summarize saved Google Photos diagnostics for `pull --dry-run`.
-
-        Args:
-            diagnostics_dir: Directory containing saved HTML/RPC artifacts.
-
-        Returns:
-            Operator-facing summary lines.
-
-        Side Effects:
-            Reads saved diagnostics from disk.
-        """
-
-        lines = [
-            "Photos UI scaffold is active; saved-diagnostics helpers are wired.",
-            "Known surface: Recently added -> search /search/<token>",
-            "Known surface: Photo detail -> media /photo/<media_id>",
-            "Known surface: Albums -> album /album/<album_id>",
-            "Known surface: Shared albums -> share /share/<album_id>?key=<opaque-key>",
-            "Known surface: Direct threads -> direct /direct/<thread_id>",
-            "Known surface: Updates -> updates /updates",
-        ]
-
-        recent_path = _preferred_recent_html_path(diagnostics_dir)
-        if recent_path.exists():
-            recent_html = recent_path.read_text(encoding="utf-8")
-            lines.extend(_summarize_recently_added(recent_html))
-        else:
-            lines.append("Saved diagnostics recently added: no saved recent capture found.")
-
-        updates_path = _preferred_updates_html_path(diagnostics_dir)
-        if updates_path.exists():
-            lines.extend(_summarize_updates(updates_path.read_text(encoding="utf-8")))
-        else:
-            lines.append("Saved updates HTML routes: no saved updates capture found.")
-            lines.append("Saved diagnostics updates: no saved updates capture found.")
-            lines.append("Saved diagnostics update previews: 0 preview media ids.")
-
-        return lines
-
 
 def _wait_for_any_visible_selector(
     page: Page,
@@ -949,37 +840,3 @@ def _combined_visible_selector(selectors: tuple[str, ...]) -> str:
     """
 
     return ", ".join(f"{selector}:visible" for selector in selectors)
-
-
-def _preferred_recent_html_path(diagnostics_dir: Path) -> Path:
-    """Description:
-    Choose the preferred Recently Added HTML artifact path.
-
-    Args:
-        diagnostics_dir: Diagnostics directory root.
-
-    Returns:
-        Live probe path when present, otherwise older probe path.
-    """
-
-    live_path = diagnostics_dir / "live_recent_probe" / "recent.html"
-    if live_path.exists():
-        return live_path
-    return diagnostics_dir / "recent_probe" / "recent.html"
-
-
-def _preferred_updates_html_path(diagnostics_dir: Path) -> Path:
-    """Description:
-    Choose the preferred Updates HTML artifact path.
-
-    Args:
-        diagnostics_dir: Diagnostics directory root.
-
-    Returns:
-        Live probe path when present, otherwise older snapshot path.
-    """
-
-    live_path = diagnostics_dir / "live_updates_probe" / "updates.html"
-    if live_path.exists():
-        return live_path
-    return diagnostics_dir / "updates-page.html"

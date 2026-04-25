@@ -2,13 +2,15 @@
 
 Description:
     Coordinates config, browser probes, enumeration, state updates, and downloads
-    for `doctor`, `login`, dry-run, and real pull commands.
+    for `doctor`, `login`, refresh, and pull commands.
 """
 
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
+import re
 import sys
 import urllib.parse
 from collections.abc import Awaitable, Callable
@@ -18,7 +20,7 @@ from datetime import UTC, datetime
 from email.message import Message
 from pathlib import Path
 from time import perf_counter
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Never, cast
 from urllib.parse import urlsplit, urlunsplit
 
 import msgspec
@@ -27,10 +29,12 @@ import msgspec.json
 from gphoto_pull.browser import (
     BrowserSessionError,
     BrowserSessionPaths,
+    browser_profile_marked_logged_in,
     collect_browser_checks,
     default_login_start_url,
     interactive_login,
     launched_browser_context_async,
+    mark_browser_profile_logged_in,
     require_browser_binaries,
 )
 from gphoto_pull.config import ConfigError, ProjectConfig
@@ -46,7 +50,6 @@ from gphoto_pull.download import (
 from gphoto_pull.enumeration import (
     EnumerationSummary,
     enumerate_index_candidates,
-    enumerate_saved_candidates,
 )
 from gphoto_pull.interrupts import (
     add_interrupt_callback,
@@ -69,11 +72,7 @@ from gphoto_pull.rpc_payloads import (
     JsonValue,
     RecentPayload,
     RpcPayloadParseError,
-    UpdatesPayload,
-    extract_init_data_requests,
-    find_updates_payload_artifact,
     merge_recent_payloads,
-    merge_updates_payloads,
     parse_batchexecute_frames,
     parse_recent_payload,
     parse_updates_payload,
@@ -97,6 +96,8 @@ TIMING_LOG_LEVEL = logging.DEBUG
 
 LOGIN_START_URL = default_login_start_url()
 DETAIL_METADATA_ENRICHMENT_TIMEOUT_SECONDS = 15.0
+ACCOUNT_SCOPE_HASH_LENGTH = 16
+_EMAIL_PATTERN = re.compile(r"[\w.!#$%&'*+/=?^_`{|}~-]+@[\w.-]+\.[A-Za-z]{2,}")
 
 
 @dataclass(slots=True)
@@ -143,6 +144,20 @@ class PullExecutionSummary:
     downloaded_count: int
     failed_count: int
     failure_media_ids: tuple[str, ...]
+
+
+@dataclass(slots=True, frozen=True)
+class AccountScope:
+    """Account-specific state namespace.
+
+    Description:
+        Carries the opaque key used in local account-scoped state paths.
+
+    Attributes:
+        key: Filesystem-safe account namespace derived from authenticated Google state.
+    """
+
+    key: str
 
 
 @dataclass(slots=True, frozen=True)
@@ -389,7 +404,7 @@ class _RecentPaginationResult:
 
 
 class GooglePhotosPuller:
-    """Application service for doctor, login, dry-run, and pull commands.
+    """Application service for doctor, login, refresh, and pull commands.
 
     Description:
         Coordinates configuration, browser lifecycle, Google Photos UI actions,
@@ -411,9 +426,12 @@ class GooglePhotosPuller:
         self.config = config
         self.photos_ui = GooglePhotosUi()
 
-    def doctor(self) -> list[DoctorCheck]:
+    def doctor(self, *, dry_run: bool = False) -> list[DoctorCheck]:
         """Description:
         Collect operator-facing prerequisite checks.
+
+        Args:
+            dry_run: Skip live browser authentication checks.
 
         Returns:
             Ordered `DoctorCheck` results.
@@ -471,6 +489,7 @@ class GooglePhotosPuller:
             )
             for check in browser_checks
         )
+        checks.append(self._doctor_auth_check(dry_run=dry_run))
         checks.append(
             DoctorCheck(
                 name="python",
@@ -480,47 +499,79 @@ class GooglePhotosPuller:
         )
         return checks
 
-    def build_plan(self) -> list[str]:
+    def _doctor_auth_check(self, *, dry_run: bool) -> DoctorCheck:
         """Description:
-        Build a dry-run plan from config and saved diagnostics.
-
-        Returns:
-            Operator-facing summary lines.
-
-        Side Effects:
-            Reads saved diagnostics.
-        """
-
-        window_value = _date_window_label(self.config.after, self.config.before)
-        strategy_detail = (
-            "Launch the app-owned persistent Playwright profile at "
-            f"{self.config.browser_profile_dir}. Run `gphoto-pull login` once if Google "
-            "requires interactive authentication; `gphoto-pull pull` reuses the same profile."
-        )
-        lines = [
-            f"Date window: {window_value}",
-            f"Config file: {self.config.config_file}",
-            f"Download directory: {self.config.download_dir}",
-            f"Sync DB path: {self.config.sync_db_path}",
-            f"Diagnostics directory: {self.config.diagnostics_dir}",
-            f"Playwright browser path: {self.config.browsers_path}",
-            f"Browser profile dir: {self.config.browser_profile_dir}",
-            f"Login/session strategy: {strategy_detail}",
-            f"Headless browser for pull: {self.config.headless}",
-            f"Download concurrency: {self.config.download_concurrency}",
-            f"Metadata enrichment concurrency: {self.config.enrichment_concurrency}",
-            f"Post-download metadata enrichment: {self.config.enrich_metadata}",
-        ]
-        lines.extend(self.photos_ui.dry_run_notes(diagnostics_dir=self.config.diagnostics_dir))
-        lines.extend(_artifact_summary_lines(self.config.diagnostics_dir))
-        return lines
-
-    def pull(self, *, dry_run: bool) -> list[str]:
-        """Description:
-        Execute a dry run or a real Google Photos pull.
+        Verify the marked persistent profile can reach authenticated Photos.
 
         Args:
-            dry_run: Report config/enumeration without downloading when `True`.
+            dry_run: Skip the live browser check.
+
+        Returns:
+            Operator-facing doctor check result.
+        """
+
+        if dry_run:
+            return DoctorCheck(
+                name="authenticated session",
+                ok=True,
+                detail="not checked because doctor is running with --dry-run",
+            )
+
+        if not browser_profile_marked_logged_in(self.config.browser_profile_dir):
+            return DoctorCheck(
+                name="authenticated session",
+                ok=True,
+                detail="not checked; run `gphoto-pull login` to mark this profile as logged in",
+            )
+
+        paths = BrowserSessionPaths(
+            download_dir=self.config.download_dir,
+            profile_dir=self.config.browser_profile_dir,
+            diagnostics_dir=self.config.diagnostics_dir,
+            browsers_path=self.config.browsers_path,
+        )
+        try:
+            require_browser_binaries(paths, browser_binary=self.config.browser_binary)
+            asyncio.run(self._check_authenticated_session_async(paths))
+        except BrowserSessionError as exc:
+            return DoctorCheck(
+                name="authenticated session",
+                ok=False,
+                detail=str(exc),
+            )
+
+        return DoctorCheck(
+            name="authenticated session",
+            ok=True,
+            detail="Recently added reached with the persistent browser profile",
+        )
+
+    async def _check_authenticated_session_async(self, paths: BrowserSessionPaths) -> None:
+        """Description:
+        Launch a short-lived browser context and prove Photos auth is usable.
+
+        Args:
+            paths: Browser paths used for the automated check.
+
+        Side Effects:
+            Launches Chromium and writes failure artifacts if authentication is missing.
+        """
+
+        async with launched_browser_context_async(
+            paths,
+            headless=True,
+            browser_binary=self.config.browser_binary,
+        ) as context:
+            await _assert_authenticated_photos_session_async(
+                context,
+                diagnostics_dir=self.config.diagnostics_dir,
+                photos_ui=self.photos_ui,
+                artifact_prefix="doctor-auth-failure",
+            )
+
+    def pull(self) -> list[str]:
+        """Description:
+        Execute a Google Photos pull.
 
         Returns:
             Operator-facing result lines.
@@ -538,32 +589,12 @@ class GooglePhotosPuller:
 
         self.config.ensure_runtime_paths()
 
-        if dry_run:
-            LOGGER.log(PHASE_LOG_LEVEL, "Building dry-run plan.")
-            lines = self.build_plan()
-            with PullStateStore(self.config.sync_db_path) as state_store:
-                LOGGER.log(PHASE_LOG_LEVEL, "Enumerating saved diagnostics.")
-                summary = enumerate_saved_candidates(
-                    diagnostics_dir=self.config.diagnostics_dir,
-                    after=self.config.after,
-                    before=self.config.before,
-                    state_store=state_store,
-                )
-            lines.extend(
-                _enumeration_summary_lines(
-                    summary,
-                    self.config.sync_db_path,
-                    label_prefix="Dry-run",
-                )
-            )
-            return lines
-
         lines = [
             f"Date window: {_date_window_label(self.config.after, self.config.before)}",
             f"Browser profile dir: {self.config.browser_profile_dir}",
             f"Download directory: {self.config.download_dir}",
             f"Diagnostics directory: {self.config.diagnostics_dir}",
-            f"Sync DB path: {self.config.sync_db_path}",
+            f"Sync DB template: {self.config.sync_db_path}",
             f"Download concurrency: {self.config.download_concurrency}",
             f"Metadata enrichment concurrency: {self.config.enrichment_concurrency}",
             f"Post-download metadata enrichment: {self.config.enrich_metadata}",
@@ -615,7 +646,7 @@ class GooglePhotosPuller:
             f"Date window: {_date_window_label(self.config.after, self.config.before)}",
             f"Browser profile dir: {self.config.browser_profile_dir}",
             f"Diagnostics directory: {self.config.diagnostics_dir}",
-            f"Sync DB path: {self.config.sync_db_path}",
+            f"Sync DB template: {self.config.sync_db_path}",
         ]
         paths = BrowserSessionPaths(
             download_dir=self.config.download_dir,
@@ -695,9 +726,22 @@ class GooglePhotosPuller:
             headless=self.config.headless,
             browser_binary=self.config.browser_binary,
         ) as context:
+            account_scope = await _assert_authenticated_photos_session_async(
+                context,
+                diagnostics_dir=self.config.diagnostics_dir,
+                photos_ui=self.photos_ui,
+                artifact_prefix="pull-auth-failure",
+            )
+            lines.append("Session check: authenticated Google Photos profile")
+            state_db_path = _account_scoped_sync_db_path(
+                self.config.sync_db_path,
+                account_scope,
+            )
+            lines.append(f"Account state scope: {account_scope.key}")
+            lines.append(f"Account sync DB path: {state_db_path}")
             if self.config.after is None:
                 raise ConfigError("`after` is required before running a pull.")
-            with PullStateStore(self.config.sync_db_path) as state_store:
+            with PullStateStore(state_db_path) as state_store:
                 if state_store.upload_coverage_satisfies(self.config.after):
                     LOGGER.log(PHASE_LOG_LEVEL, "Using covered media index.")
                     records = state_store.list_media_in_upload_window(
@@ -712,7 +756,7 @@ class GooglePhotosPuller:
                     lines.extend(
                         _enumeration_summary_lines(
                             summary,
-                            self.config.sync_db_path,
+                            state_db_path,
                             label_prefix="Indexed",
                         )
                     )
@@ -755,7 +799,7 @@ class GooglePhotosPuller:
                     lines.extend(
                         _enumeration_summary_lines(
                             summary,
-                            self.config.sync_db_path,
+                            state_db_path,
                             label_prefix="Indexed",
                         )
                     )
@@ -856,9 +900,22 @@ class GooglePhotosPuller:
             headless=self.config.headless,
             browser_binary=self.config.browser_binary,
         ) as context:
+            account_scope = await _assert_authenticated_photos_session_async(
+                context,
+                diagnostics_dir=self.config.diagnostics_dir,
+                photos_ui=self.photos_ui,
+                artifact_prefix="refresh-auth-failure",
+            )
+            lines.append("Session check: authenticated Google Photos profile")
+            state_db_path = _account_scoped_sync_db_path(
+                self.config.sync_db_path,
+                account_scope,
+            )
+            lines.append(f"Account state scope: {account_scope.key}")
+            lines.append(f"Account sync DB path: {state_db_path}")
             if self.config.after is None:
                 raise ConfigError("`after` is required before running refresh.")
-            with PullStateStore(self.config.sync_db_path) as state_store:
+            with PullStateStore(state_db_path) as state_store:
                 LOGGER.log(PHASE_LOG_LEVEL, "Capturing Recently added diagnostics.")
                 recent_page = await context.new_page()
                 recent_response_count = await _capture_recent_probe_async(
@@ -897,7 +954,7 @@ class GooglePhotosPuller:
                 lines.extend(
                     _enumeration_summary_lines(
                         summary,
-                        self.config.sync_db_path,
+                        state_db_path,
                         label_prefix="Refresh",
                     )
                 )
@@ -923,11 +980,12 @@ class GooglePhotosPuller:
             browser_binary=self.config.browser_binary,
             start_url=LOGIN_START_URL,
         )
+        mark_browser_profile_logged_in(profile_dir)
 
         return [
             f"Opened persistent browser profile: {profile_dir}",
             "Login state is stored in that browser profile.",
-            "You can now rerun `gphoto-pull doctor` or `gphoto-pull pull --dry-run`.",
+            "You can now rerun `gphoto-pull doctor` or `gphoto-pull pull`.",
         ]
 
 
@@ -970,86 +1028,6 @@ async def _wait_for_interrupt_request() -> None:
         remove_interrupt_callback(notify)
 
 
-def _artifact_summary_lines(diagnostics_dir: Path) -> list[str]:
-    """Description:
-    Summarize saved diagnostic artifacts for dry-run and plan output.
-
-    Args:
-        diagnostics_dir: Directory containing probe artifacts.
-
-    Returns:
-        Operator-facing summary lines.
-
-    Side Effects:
-        Reads saved HTML and batchexecute response artifacts.
-    """
-
-    lines: list[str] = []
-    recent_artifact = _preferred_recent_html_path(diagnostics_dir)
-    updates_html_artifact = _preferred_updates_html_path(diagnostics_dir)
-    live_recent_payloads = _parse_recent_payloads_from_dir(diagnostics_dir / "live_recent_probe")
-    live_updates_payloads = _parse_updates_payloads_from_dir(diagnostics_dir / "live_updates_probe")
-    updates_artifact = find_updates_payload_artifact(diagnostics_dir)
-
-    if recent_artifact.exists():
-        try:
-            requests = extract_init_data_requests(recent_artifact.read_text(encoding="utf-8"))
-        except RpcPayloadParseError as exc:
-            lines.append(f"Saved recent bootstrap summary: unreadable ({exc}).")
-        else:
-            request = next((item for item in requests if item.rpcid == "eNG3nf"), requests[-1])
-            lines.append(
-                f"Saved recent bootstrap summary: {request.ds_key} uses rpcid {request.rpcid}."
-            )
-        if live_recent_payloads:
-            merged_recent = merge_recent_payloads(live_recent_payloads)
-            lines.append(
-                "Saved recent live payload summary: "
-                f"{len(merged_recent.items)} media items across rpc ids "
-                f"{', '.join(merged_recent.rpc_ids) or '<none>'}."
-            )
-    else:
-        lines.append("Saved recent bootstrap summary: no recent HTML artifact captured yet.")
-
-    if live_updates_payloads:
-        merged_updates = merge_updates_payloads(live_updates_payloads)
-        lines.append(
-            "Saved updates artifact summary: "
-            f"{len(merged_updates.activities)} activities across rpc ids "
-            f"{', '.join(merged_updates.rpc_ids) or '<none>'}."
-        )
-        if merged_updates.activities:
-            lines.append(
-                "Saved updates activity kinds: "
-                + ", ".join(activity.activity_kind for activity in merged_updates.activities)
-            )
-    elif updates_artifact is not None:
-        try:
-            updates = parse_updates_payload(updates_artifact.read_text(encoding="utf-8"))
-        except RpcPayloadParseError as exc:
-            lines.append(f"Saved updates artifact summary: unreadable ({exc}).")
-        else:
-            lines.append(
-                "Saved updates artifact summary: "
-                f"{len(updates.activities)} activities across rpc ids "
-                f"{', '.join(updates.rpc_ids) or '<none>'}."
-            )
-            if updates.activities:
-                lines.append(
-                    "Saved updates activity kinds: "
-                    + ", ".join(activity.activity_kind for activity in updates.activities)
-                )
-    else:
-        lines.append(
-            "Saved updates artifact summary: no updates batchexecute artifact captured yet."
-        )
-
-    if not updates_html_artifact.exists():
-        lines.append("Saved updates HTML artifact: no saved updates capture found.")
-
-    return lines
-
-
 def _enumeration_summary_lines(
     summary: EnumerationSummary,
     sync_db_path: Path,
@@ -1062,7 +1040,7 @@ def _enumeration_summary_lines(
     Args:
         summary: Enumeration result to summarize.
         sync_db_path: State database path used for persisted candidates.
-        label_prefix: Prefix that distinguishes dry-run and live enumeration.
+        label_prefix: Prefix that identifies the enumeration source.
 
     Returns:
         Operator-facing summary lines.
@@ -1093,86 +1071,6 @@ def _enumeration_summary_lines(
         )
 
     return lines
-
-
-def _preferred_recent_html_path(diagnostics_dir: Path) -> Path:
-    """Description:
-    Choose the preferred Recently Added HTML artifact path.
-
-    Args:
-        diagnostics_dir: Diagnostics directory root.
-
-    Returns:
-        Live probe path when present, otherwise the older probe path.
-    """
-
-    live_path = diagnostics_dir / "live_recent_probe" / "recent.html"
-    if live_path.exists():
-        return live_path
-    return diagnostics_dir / "recent_probe" / "recent.html"
-
-
-def _preferred_updates_html_path(diagnostics_dir: Path) -> Path:
-    """Description:
-    Choose the preferred Updates HTML artifact path.
-
-    Args:
-        diagnostics_dir: Diagnostics directory root.
-
-    Returns:
-        Live probe path when present, otherwise the older updates snapshot path.
-    """
-
-    live_path = diagnostics_dir / "live_updates_probe" / "updates.html"
-    if live_path.exists():
-        return live_path
-    return diagnostics_dir / "updates-page.html"
-
-
-def _parse_recent_payloads_from_dir(directory: Path) -> list[RecentPayload]:
-    """Description:
-    Parse all readable Recently Added response artifacts in a directory.
-
-    Args:
-        directory: Probe artifact directory.
-
-    Returns:
-        Parsed recent payloads, skipping unreadable candidates.
-
-    Side Effects:
-        Reads response artifact files.
-    """
-
-    payloads: list[RecentPayload] = []
-    for path in sorted(directory.glob("resp_*.txt")):
-        try:
-            payloads.append(parse_recent_payload(path.read_text(encoding="utf-8")))
-        except RpcPayloadParseError:
-            continue
-    return payloads
-
-
-def _parse_updates_payloads_from_dir(directory: Path) -> list[UpdatesPayload]:
-    """Description:
-    Parse all readable Updates response artifacts in a directory.
-
-    Args:
-        directory: Probe artifact directory.
-
-    Returns:
-        Parsed Updates payloads, skipping unreadable candidates.
-
-    Side Effects:
-        Reads response artifact files.
-    """
-
-    payloads: list[UpdatesPayload] = []
-    for path in sorted(directory.glob("resp_*.txt")):
-        try:
-            payloads.append(parse_updates_payload(path.read_text(encoding="utf-8")))
-        except RpcPayloadParseError:
-            continue
-    return payloads
 
 
 async def _capture_recent_probe_async(
@@ -1212,6 +1110,12 @@ async def _capture_recent_probe_async(
         try:
             raise_if_interrupt_requested()
             await page.goto(RECENTLY_ADDED_URL, wait_until="domcontentloaded")
+            if classify_photos_url(page.url).surface is not PhotosSurface.SEARCH_RESULTS:
+                await _raise_recent_auth_error_async(
+                    page,
+                    diagnostics_dir=diagnostics_dir,
+                    artifact_prefix="recent-auth-failure",
+                )
             with suppress(PlaywrightTimeoutError):
                 await photos_ui.wait_for_recently_added_async(page, timeout_ms=10_000)
             await _wait_for_capture_or_visible_recent(
@@ -1326,6 +1230,135 @@ async def _capture_recent_probe_async(
         return len(capture.response_texts)
     finally:
         await _close_response_capture(capture)
+
+
+async def _assert_authenticated_photos_session_async(
+    context: AsyncBrowserContext,
+    *,
+    diagnostics_dir: Path,
+    photos_ui: GooglePhotosUi,
+    artifact_prefix: str,
+) -> AccountScope:
+    """Description:
+    Prove the persistent browser profile reaches authenticated Google Photos.
+
+    Args:
+        context: Browser context using the persistent profile.
+        diagnostics_dir: Diagnostics directory root.
+        photos_ui: Google Photos UI adapter.
+        artifact_prefix: Failure artifact filename prefix.
+
+    Returns:
+        Account state scope derived from the authenticated Photos shell.
+
+    Side Effects:
+        Opens a page and writes diagnostics when authentication is missing.
+    """
+
+    from playwright.async_api import Error as PlaywrightError
+    from playwright.async_api import TimeoutError as PlaywrightTimeoutError
+
+    page = await context.new_page()
+    try:
+        try:
+            raise_if_interrupt_requested()
+            await page.goto(RECENTLY_ADDED_URL, wait_until="domcontentloaded")
+            if classify_photos_url(page.url).surface is not PhotosSurface.SEARCH_RESULTS:
+                await _raise_recent_auth_error_async(
+                    page,
+                    diagnostics_dir=diagnostics_dir,
+                    artifact_prefix=artifact_prefix,
+                )
+            with suppress(PlaywrightTimeoutError):
+                await photos_ui.wait_for_recently_added_async(page, timeout_ms=10_000)
+        except PlaywrightError as exc:
+            if interrupt_requested():
+                raise KeyboardInterrupt from exc
+            raise BrowserSessionError(
+                f"Failed to open Recently added for auth check: {exc}"
+            ) from exc
+
+        location = classify_photos_url(page.url)
+        if location.surface is PhotosSurface.SEARCH_RESULTS:
+            try:
+                return await _photos_account_scope_from_page_async(page)
+            except BrowserSessionError:
+                await _write_failure_artifacts_async(
+                    page,
+                    diagnostics_dir / "pull_failures",
+                    artifact_prefix,
+                )
+                raise
+
+        await _raise_recent_auth_error_async(
+            page,
+            diagnostics_dir=diagnostics_dir,
+            artifact_prefix=artifact_prefix,
+        )
+    finally:
+        await page.close()
+
+
+async def _photos_account_scope_from_page_async(page: AsyncPage) -> AccountScope:
+    """Description:
+    Derive an account namespace from the authenticated Google Photos page.
+
+    Args:
+        page: Authenticated Photos page.
+
+    Returns:
+        Account scope from the signed-in Google account control.
+    """
+
+    raw_label = await page.evaluate(
+        """() => {
+            const accountControl = document.querySelector('[aria-label^="Google Account"]');
+            return accountControl ? accountControl.getAttribute("aria-label") : null;
+        }"""
+    )
+    identity = _account_identity_from_google_account_label(raw_label)
+    return AccountScope(_account_scope_key(identity))
+
+
+def _account_identity_from_google_account_label(raw_label: object) -> str:
+    if not isinstance(raw_label, str):
+        raise BrowserSessionError(
+            "Authenticated Google Photos page is missing the Google Account aria-label. "
+            "The page structure changed; update the account selector."
+        )
+
+    email_match = _EMAIL_PATTERN.search(raw_label)
+    if email_match is None:
+        raise BrowserSessionError(
+            "Authenticated Google Photos Google Account aria-label did not contain an email "
+            "address. The page structure changed; update the account selector."
+        )
+    return f"email:{email_match.group(0).lower()}"
+
+
+def _account_scope_key(identity: str) -> str:
+    return hashlib.sha256(identity.encode("utf-8")).hexdigest()[:ACCOUNT_SCOPE_HASH_LENGTH]
+
+
+def _account_scoped_sync_db_path(sync_db_template: Path, account_scope: AccountScope) -> Path:
+    return sync_db_template.parent / "accounts" / account_scope.key / sync_db_template.name
+
+
+async def _raise_recent_auth_error_async(
+    page: AsyncPage,
+    *,
+    diagnostics_dir: Path,
+    artifact_prefix: str,
+) -> Never:
+    await _write_failure_artifacts_async(
+        page,
+        diagnostics_dir / "pull_failures",
+        artifact_prefix,
+    )
+    raise BrowserSessionError(
+        "Persistent browser profile did not reach the authenticated Recently added route. "
+        f"Current URL: {page.url}. Rerun `gphoto-pull login`."
+    )
 
 
 async def _capture_updates_probe_async(
@@ -2358,6 +2391,8 @@ async def _download_candidates_async(
     progress = PullProgressDisplay(
         total_items=len(queued_candidates),
         interactive=progress_interactive,
+        reserved_active_rows=download_concurrency
+        + (enrichment_concurrency if enrich_metadata else 0),
     )
     queue: asyncio.Queue[tuple[MediaMetadata, MediaStateRecord]] = asyncio.Queue()
     for candidate in queued_candidates:
@@ -2467,14 +2502,6 @@ async def _download_candidates_async(
                     )
                     progress.mark_started(
                         expected_bytes=pending_download.download_trace.content_length
-                    )
-                    progress.update_item(
-                        slot,
-                        "finalize",
-                        _download_item_log_line(
-                            pending_download.metadata,
-                            expected_bytes=pending_download.download_trace.content_length,
-                        ),
                     )
                     downloaded_count, failed_count = await _finalize_pending_download_async(
                         pending_download,
@@ -2922,8 +2949,6 @@ async def _start_download_candidate_once_async(
             )
         finally:
             await _close_response_capture(detail_capture)
-        if on_stage is not None:
-            on_stage("download", metadata, download_trace)
         return _pending_download_from_started_download_async(
             page=page,
             slot=slot,
@@ -3089,16 +3114,28 @@ async def _finalize_pending_download_async(
     from playwright.async_api import Error as PlaywrightError
 
     plan = _resolve_pending_download_plan(pending_download)
-    finalize_begin_at = perf_counter()
+    operation_begin_at = perf_counter()
+    phase = "download"
+    phase_begin_at = operation_begin_at
+    item_detail = _download_item_log_line(
+        pending_download.metadata,
+        expected_bytes=pending_download.download_trace.content_length,
+    )
     try:
         raise_if_interrupt_requested()
         staging_path = create_staging_path(plan)
+        progress.update_item(pending_download.slot, "download", item_detail)
         await pending_download.download.save_as(str(staging_path))
+        download_elapsed = perf_counter() - phase_begin_at
+        phase = "finalize"
+        phase_begin_at = perf_counter()
+        progress.update_item(pending_download.slot, "finalize", item_detail)
         final_path = finalize_download(
             staging_path,
             plan,
             staging_path=staging_path,
         )
+        finalize_elapsed = perf_counter() - phase_begin_at
     except PlaywrightError as exc:
         if interrupt_requested():
             raise KeyboardInterrupt from exc
@@ -3106,10 +3143,11 @@ async def _finalize_pending_download_async(
             raise BrowserSessionError("Browser session ended during pull.") from exc
         LOGGER.log(
             TIMING_LOG_LEVEL,
-            "timing failed slot=%s name=%s phase=finalize finalize=%.2fs total=%.2fs error=%s",
+            "timing failed slot=%s name=%s phase=%s elapsed=%.2fs total=%.2fs error=%s",
             pending_download.slot + 1,
             _display_name(pending_download.metadata),
-            perf_counter() - finalize_begin_at,
+            phase,
+            perf_counter() - phase_begin_at,
             perf_counter() - pending_download.queued_at,
             exc,
         )
@@ -3130,10 +3168,11 @@ async def _finalize_pending_download_async(
             raise KeyboardInterrupt from exc
         LOGGER.log(
             TIMING_LOG_LEVEL,
-            "timing failed slot=%s name=%s phase=finalize finalize=%.2fs total=%.2fs error=%s",
+            "timing failed slot=%s name=%s phase=%s elapsed=%.2fs total=%.2fs error=%s",
             pending_download.slot + 1,
             _display_name(pending_download.metadata),
-            perf_counter() - finalize_begin_at,
+            phase,
+            perf_counter() - phase_begin_at,
             perf_counter() - pending_download.queued_at,
             exc,
         )
@@ -3152,7 +3191,6 @@ async def _finalize_pending_download_async(
     finally:
         await _cleanup_playwright_download_async(pending_download.download)
 
-    finalize_elapsed = perf_counter() - finalize_begin_at
     final_metadata = replace(
         pending_download.metadata,
         filename=final_path.name,
@@ -3167,9 +3205,10 @@ async def _finalize_pending_download_async(
     )
     LOGGER.log(
         TIMING_LOG_LEVEL,
-        "timing finalized slot=%s name=%s finalize=%.2fs total=%.2fs bytes=%s",
+        ("timing finalized slot=%s name=%s download=%.2fs finalize=%.2fs total=%.2fs bytes=%s"),
         pending_download.slot + 1,
         _display_name(final_metadata),
+        download_elapsed,
         finalize_elapsed,
         perf_counter() - pending_download.queued_at,
         final_metadata.bytes_size or 0,
@@ -3191,9 +3230,13 @@ async def _finalize_pending_download_async(
         )
     LOGGER.log(
         TIMING_LOG_LEVEL,
-        "timing done slot=%s name=%s finalize=%.2fs enrichment_queued=%s total=%.2fs bytes=%s",
+        (
+            "timing done slot=%s name=%s download=%.2fs finalize=%.2fs "
+            "enrichment_queued=%s total=%.2fs bytes=%s"
+        ),
         pending_download.slot + 1,
         _display_name(final_metadata),
+        download_elapsed,
         finalize_elapsed,
         enrichment_queue is not None and detail_metadata is None,
         perf_counter() - pending_download.queued_at,
@@ -3696,8 +3739,6 @@ async def _trigger_direct_download_async(
         _display_name(metadata),
         perf_counter() - request_begin,
     )
-    if on_stage is not None:
-        on_stage("download", metadata, download_trace)
     return download, replace(
         download_trace,
         download_url=download_trace.download_url or direct_url,

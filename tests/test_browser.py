@@ -1,25 +1,34 @@
 # pyright: reportPrivateUsage=false
 
+import asyncio
 import sys
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import ModuleType, SimpleNamespace, TracebackType
-from unittest.mock import Mock, patch
+from typing import cast
+from unittest.mock import AsyncMock, Mock, patch
 from urllib.parse import parse_qs, urlparse
+
+from playwright.async_api import Playwright as AsyncPlaywright
 
 from gphoto_pull.browser import (
     DEFAULT_BROWSER_URL,
     BrowserSessionPaths,
+    _cleanup_stale_chromium_singleton_files,
+    _launch_persistent_context_async,
     browser_binaries_available,
+    browser_profile_marked_logged_in,
     collect_browser_checks,
     interactive_login,
+    mark_browser_profile_logged_in,
 )
 
 
 class _FakeLoginProcess:
     def __init__(self, *, running: bool) -> None:
         self.running = running
+        self.pid = 12345
         self.terminate = Mock()
         self.wait = Mock()
 
@@ -87,6 +96,16 @@ class BrowserSessionPathsTests(unittest.TestCase):
             self.assertTrue(paths.diagnostics_dir.exists())
             self.assertTrue(paths.browsers_path.exists())
 
+    def test_login_marker_tracks_completed_profile_login(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            profile_dir = Path(tmp_dir) / "chrome-profile"
+
+            self.assertFalse(browser_profile_marked_logged_in(profile_dir))
+
+            mark_browser_profile_logged_in(profile_dir)
+
+            self.assertTrue(browser_profile_marked_logged_in(profile_dir))
+
     def test_browser_binaries_available_reports_missing_install(self) -> None:
         with TemporaryDirectory() as tmp_dir:
             expected_executable = Path(tmp_dir) / ".playwright" / "fake-platform" / "chromium"
@@ -125,6 +144,40 @@ class BrowserSessionPathsTests(unittest.TestCase):
             self.assertTrue(all(check.ok for check in checks))
             self.assertEqual(checks[1].detail, str(paths.profile_dir))
 
+    def test_cleanup_stale_chromium_singleton_files_removes_dead_local_lock(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            profile_dir = Path(tmp_dir)
+            (profile_dir / "SingletonLock").symlink_to("test-host-123")
+            (profile_dir / "SingletonSocket").symlink_to("/tmp/missing-socket")
+            (profile_dir / "SingletonCookie").symlink_to("cookie")
+
+            with (
+                patch("gphoto_pull.browser._current_hostname", return_value="test-host"),
+                patch("gphoto_pull.browser._process_is_running", return_value=False),
+            ):
+                _cleanup_stale_chromium_singleton_files(profile_dir)
+
+            self.assertFalse((profile_dir / "SingletonLock").is_symlink())
+            self.assertFalse((profile_dir / "SingletonSocket").is_symlink())
+            self.assertFalse((profile_dir / "SingletonCookie").is_symlink())
+
+    def test_cleanup_stale_chromium_singleton_files_keeps_live_local_lock(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            profile_dir = Path(tmp_dir)
+            (profile_dir / "SingletonLock").symlink_to("test-host-123")
+            (profile_dir / "SingletonSocket").symlink_to("/tmp/live-socket")
+            (profile_dir / "SingletonCookie").symlink_to("cookie")
+
+            with (
+                patch("gphoto_pull.browser._current_hostname", return_value="test-host"),
+                patch("gphoto_pull.browser._process_is_running", return_value=True),
+            ):
+                _cleanup_stale_chromium_singleton_files(profile_dir)
+
+            self.assertTrue((profile_dir / "SingletonLock").is_symlink())
+            self.assertTrue((profile_dir / "SingletonSocket").is_symlink())
+            self.assertTrue((profile_dir / "SingletonCookie").is_symlink())
+
     def test_interactive_login_launches_browser_without_playwright_control(self) -> None:
         with TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir)
@@ -146,11 +199,12 @@ class BrowserSessionPathsTests(unittest.TestCase):
                 result = interactive_login(paths)
 
             self.assertEqual(result, paths.profile_dir)
-            popen.assert_called_once()
+            self.assertGreaterEqual(popen.call_count, 1)
             command = popen.call_args.args[0]
             self.assertEqual(command[0], str(executable_path))
             self.assertIn(f"--user-data-dir={paths.profile_dir}", command)
             self.assertIn("--new-window", command)
+            self.assertIn("--allow-browser-signin=false", command)
             self.assertIn("--password-store=basic", command)
             self.assertIn("--use-mock-keychain", command)
             process.terminate.assert_called_once_with()
@@ -188,3 +242,34 @@ class BrowserSessionPathsTests(unittest.TestCase):
             self.assertEqual(command[-1], "https://accounts.google.com/custom")
             process.terminate.assert_not_called()
             process.wait.assert_not_called()
+
+    def test_persistent_context_disables_browser_signin(self) -> None:
+        class AsyncChromium:
+            def __init__(self) -> None:
+                self.launch_persistent_context = AsyncMock(return_value=object())
+
+        with TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            paths = BrowserSessionPaths(
+                download_dir=root / "downloads",
+                profile_dir=root / "chrome-profile",
+                browsers_path=root / ".playwright",
+            )
+            chromium = AsyncChromium()
+            playwright = SimpleNamespace(chromium=chromium)
+
+            result = asyncio.run(
+                _launch_persistent_context_async(
+                    cast("AsyncPlaywright", playwright),
+                    paths,
+                    headless=True,
+                    browser_binary=None,
+                )
+            )
+
+            self.assertIsNotNone(result)
+            chromium.launch_persistent_context.assert_called_once()
+            self.assertIn(
+                "--allow-browser-signin=false",
+                chromium.launch_persistent_context.call_args.kwargs["args"],
+            )

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import socket
 import subprocess
 import time
 from collections.abc import Iterator
@@ -20,6 +21,8 @@ from typing import TYPE_CHECKING
 from urllib.parse import urlencode
 
 DEFAULT_BROWSER_URL = "https://photos.google.com/"
+LOGIN_MARKER_FILENAME = ".gphoto-pull-login-complete"
+CHROMIUM_PROFILE_COMPAT_ARGS = ("--allow-browser-signin=false",)
 LOGIN_PROFILE_COMPAT_ARGS = (
     "--password-store=basic",
     "--use-mock-keychain",
@@ -93,6 +96,35 @@ class BrowserSessionPaths:
             self.browsers_path,
         ):
             path.mkdir(parents=True, exist_ok=True)
+
+
+def browser_profile_marked_logged_in(profile_dir: Path) -> bool:
+    """Description:
+    Check whether this profile completed an interactive login session.
+
+    Args:
+        profile_dir: Persistent Chromium profile directory.
+
+    Returns:
+        Whether `gphoto-pull login` has marked the profile as login-ready.
+    """
+
+    return (profile_dir / LOGIN_MARKER_FILENAME).is_file()
+
+
+def mark_browser_profile_logged_in(profile_dir: Path) -> None:
+    """Description:
+    Record that the persistent profile completed an interactive login session.
+
+    Args:
+        profile_dir: Persistent Chromium profile directory.
+
+    Side Effects:
+        Creates or updates a marker file in the browser profile directory.
+    """
+
+    profile_dir.mkdir(parents=True, exist_ok=True)
+    (profile_dir / LOGIN_MARKER_FILENAME).write_text(f"{time.time():.0f}\n", encoding="utf-8")
 
 
 @contextmanager
@@ -219,6 +251,64 @@ def require_browser_binaries(paths: BrowserSessionPaths, *, browser_binary: str 
     _require_browser_binaries(paths, browser_binary=browser_binary)
 
 
+def _cleanup_stale_chromium_singleton_files(profile_dir: Path) -> None:
+    """Description:
+    Remove Chromium profile singleton files when they point at a dead local PID.
+
+    Args:
+        profile_dir: Persistent Chromium profile directory.
+
+    Side Effects:
+        Removes stale Chromium singleton symlinks from the profile directory.
+    """
+
+    owner = _chromium_singleton_owner(profile_dir)
+    if owner is None:
+        return
+
+    hostname, pid = owner
+    if hostname != _current_hostname() or _process_is_running(pid):
+        return
+
+    for name in ("SingletonLock", "SingletonSocket", "SingletonCookie"):
+        with suppress(FileNotFoundError):
+            (profile_dir / name).unlink()
+
+
+def _chromium_singleton_owner(profile_dir: Path) -> tuple[str, int] | None:
+    lock_path = profile_dir / "SingletonLock"
+    if not lock_path.is_symlink():
+        return None
+
+    try:
+        lock_target = str(lock_path.readlink())
+    except OSError:
+        return None
+
+    hostname, separator, pid_text = lock_target.rpartition("-")
+    if not hostname or not separator:
+        return None
+
+    try:
+        return hostname, int(pid_text)
+    except ValueError:
+        return None
+
+
+def _current_hostname() -> str:
+    return socket.gethostname()
+
+
+def _process_is_running(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
 @contextmanager
 def _playwright_browsers_path(paths: BrowserSessionPaths) -> Iterator[None]:
     """Description:
@@ -342,6 +432,7 @@ async def _launch_persistent_context_async(
                 downloads_path=str(paths.download_dir),
                 handle_sigint=True,
                 executable_path=browser_binary,
+                args=list(CHROMIUM_PROFILE_COMPAT_ARGS),
             )
 
         return await playwright.chromium.launch_persistent_context(
@@ -350,6 +441,7 @@ async def _launch_persistent_context_async(
             accept_downloads=True,
             downloads_path=str(paths.download_dir),
             handle_sigint=True,
+            args=list(CHROMIUM_PROFILE_COMPAT_ARGS),
         )
     except PlaywrightError as exc:
         raise BrowserSessionError(str(exc)) from exc
@@ -379,6 +471,7 @@ def interactive_login(
     """
 
     paths.ensure_runtime_directories()
+    _cleanup_stale_chromium_singleton_files(paths.profile_dir)
     _require_browser_binaries(paths, browser_binary=browser_binary)
     login_start_url = default_login_start_url() if start_url is None else start_url
     executable_path = (
@@ -386,23 +479,24 @@ def interactive_login(
         if browser_binary is not None
         else chromium_executable_path(paths.browsers_path)
     )
+    command = [
+        str(executable_path),
+        f"--user-data-dir={paths.profile_dir}",
+        "--no-first-run",
+        "--new-window",
+        *CHROMIUM_PROFILE_COMPAT_ARGS,
+        *LOGIN_PROFILE_COMPAT_ARGS,
+        login_start_url,
+    ]
     login_log_path = paths.diagnostics_dir / "login-browser.log"
     with login_log_path.open("ab") as login_log:
-        process = subprocess.Popen(
-            [
-                str(executable_path),
-                f"--user-data-dir={paths.profile_dir}",
-                "--no-first-run",
-                "--new-window",
-                *LOGIN_PROFILE_COMPAT_ARGS,
-                login_start_url,
-            ],
-            stdout=subprocess.DEVNULL,
-            stderr=login_log,
-        )
+        process = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=login_log)
         try:
             print("Complete login and MFA in the opened browser, then press Enter here.")
-            _wait_for_login_confirmation(process, login_log_path=login_log_path)
+            _wait_for_login_confirmation(
+                process,
+                login_log_path=login_log_path,
+            )
         finally:
             if process.poll() is None:
                 process.terminate()
@@ -472,6 +566,7 @@ async def launched_browser_context_async(
     from playwright.async_api import async_playwright
 
     paths.ensure_runtime_directories()
+    _cleanup_stale_chromium_singleton_files(paths.profile_dir)
 
     with _playwright_browsers_path(paths):
         async with async_playwright() as playwright:

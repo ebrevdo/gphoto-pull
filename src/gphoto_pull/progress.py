@@ -148,6 +148,7 @@ class PullProgressDisplay:
         progress: Mutable progress counter model.
         stream: Text stream used for output.
         interactive: Whether Rich live rendering is enabled.
+        reserved_active_rows: Worker rows to reserve in the live layout.
     """
 
     def __init__(
@@ -156,6 +157,7 @@ class PullProgressDisplay:
         total_items: int,
         stream: TextIO | None = None,
         interactive: bool | None = None,
+        reserved_active_rows: int = 1,
     ) -> None:
         """Description:
         Create a live progress display.
@@ -164,6 +166,7 @@ class PullProgressDisplay:
             total_items: Number of queued items.
             stream: Optional output stream. Defaults to `sys.stderr`.
             interactive: Optional override for TTY detection.
+            reserved_active_rows: Worker rows to reserve in the live layout.
 
         Side Effects:
             Starts a Rich live renderer when interactive.
@@ -172,6 +175,7 @@ class PullProgressDisplay:
         self.progress = PullProgress(total_items=total_items)
         self.stream = sys.stderr if stream is None else stream
         self.interactive = self.stream.isatty() if interactive is None else interactive
+        self._reserved_active_rows = max(1, reserved_active_rows)
         self._console = Console(file=self.stream, force_terminal=self.interactive)
         self._rich_progress = Progress(
             TextColumn("[bold cyan]{task.description}[/]"),
@@ -326,10 +330,9 @@ class PullProgressDisplay:
             Group containing progress bars and item tables.
         """
 
-        active_rows = max(1, len(self._active))
         recent_limit = recent_row_limit(
             console_height=self._console.size.height,
-            active_rows=active_rows,
+            active_rows=self._reserved_active_rows,
         )
         recent_rows = list(self._recent)[:recent_limit]
         sections: list[RenderableType] = []
@@ -337,11 +340,35 @@ class PullProgressDisplay:
             sections.append(_item_table("Recent completions", recent_rows, show_slot=False))
         sections.extend(
             [
-                _item_table("Active downloads", self._active.values(), show_slot=True),
+                _item_table("Active downloads", self._active_rows(), show_slot=False),
                 self._rich_progress,
             ]
         )
         return Group(*sections)
+
+    def _active_rows(self) -> list[PullItemStatus]:
+        """Description:
+        Return a fixed-height active worker row set for stable live rendering.
+
+        Returns:
+            Active rows with blank placeholders for idle worker slots.
+        """
+
+        return [
+            self._active.get(
+                slot,
+                PullItemStatus(
+                    slot=slot,
+                    status="",
+                    name="",
+                    uploaded="",
+                    captured="",
+                    media_type="",
+                    size="",
+                ),
+            )
+            for slot in range(self._reserved_active_rows)
+        ]
 
 
 def _item_table(title: str, items: Iterable[PullItemStatus], *, show_slot: bool) -> Table:
@@ -361,7 +388,7 @@ def _item_table(title: str, items: Iterable[PullItemStatus], *, show_slot: bool)
     if show_slot:
         table.add_column("Slot", justify="right", no_wrap=True, style="dim")
     table.add_column("Status", no_wrap=True)
-    table.add_column("Name", overflow="fold", ratio=4)
+    table.add_column("Name", overflow="ellipsis", no_wrap=True, ratio=4)
     table.add_column("Uploaded", no_wrap=True, ratio=1)
     table.add_column("Captured", no_wrap=True, ratio=1)
     table.add_column("Type", no_wrap=True, ratio=1)

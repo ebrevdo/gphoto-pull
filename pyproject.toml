@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "gphoto-pull"
-version = "0.0.1"
+version = "0.0.2"
 description = "Browser-automation tooling for pulling recent media from Google Photos."
 readme = "README.md"
 requires-python = ">=3.13"

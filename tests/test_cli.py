@@ -11,6 +11,7 @@ from gphoto_pull.automation import GooglePhotosPuller
 from gphoto_pull.browser import BrowserSessionError, BrowserSessionPaths
 from gphoto_pull.cli import (
     ConfigCommand,
+    DoctorCommand,
     InstallBrowserCommand,
     LoginCommand,
     PullCommand,
@@ -52,6 +53,14 @@ class CliTests(unittest.TestCase):
         args = parse_args(["install-browser"])
 
         self.assertIsInstance(args.command, InstallBrowserCommand)
+
+    def test_parse_args_accepts_doctor_dry_run(self) -> None:
+        args = parse_args(["doctor", "--dry-run"])
+
+        command = args.command
+        self.assertIsInstance(command, DoctorCommand)
+        assert isinstance(command, DoctorCommand)
+        self.assertTrue(command.dry_run)
 
     def test_parse_args_defaults_reset_to_all(self) -> None:
         args = parse_args(["reset", "--yes"])
@@ -189,7 +198,6 @@ class CliTests(unittest.TestCase):
                         "11",
                         "--headed",
                         "--no-enrich-metadata",
-                        "--dry-run",
                     ]
                 )
 
@@ -223,7 +231,7 @@ class CliTests(unittest.TestCase):
                 puller_class.return_value = service
                 try:
                     os.chdir(root)
-                    exit_code = main(["--config", "configs/dev.toml", "pull", "--dry-run"])
+                    exit_code = main(["--config", "configs/dev.toml", "pull"])
                 finally:
                     os.chdir(original_cwd)
 
@@ -237,9 +245,9 @@ class CliTests(unittest.TestCase):
     def test_main_runs_refresh_reset_command(self) -> None:
         with TemporaryDirectory() as tmp_dir:
             config_path = Path(tmp_dir) / "gphoto-pull.toml"
-            index_path = Path(tmp_dir) / "state.sqlite3"
+            account_state_dir = Path(tmp_dir) / "accounts"
             config_path.write_text('sync_db_path = "state.sqlite3"\n', encoding="utf-8")
-            index_path.write_text("index", encoding="utf-8")
+            (account_state_dir / "account-key").mkdir(parents=True)
             with (
                 patch("gphoto_pull.cli.GooglePhotosPuller") as puller_class,
                 io.StringIO() as stderr,
@@ -262,7 +270,7 @@ class CliTests(unittest.TestCase):
                 rendered = stderr.getvalue()
 
             self.assertEqual(exit_code, 0)
-            self.assertFalse(index_path.exists())
+            self.assertFalse(account_state_dir.exists())
             service.refresh.assert_called_once()
             self.assertIn("Deleted media index:", rendered)
             self.assertIn("Refresh result", rendered)
@@ -386,11 +394,10 @@ class CliTests(unittest.TestCase):
             config_path = Path(tmp_dir) / "gphoto-pull.toml"
             profile_dir = Path(tmp_dir) / "chrome-profile"
             browsers_dir = Path(tmp_dir) / "browsers"
-            index_path = Path(tmp_dir) / "state" / "pull-state.sqlite3"
+            account_state_dir = Path(tmp_dir) / "state" / "accounts"
             profile_dir.mkdir()
             browsers_dir.mkdir()
-            index_path.parent.mkdir()
-            index_path.write_text("index", encoding="utf-8")
+            (account_state_dir / "account-key").mkdir(parents=True)
             config_path.write_text(
                 "\n".join(
                     [
@@ -408,7 +415,7 @@ class CliTests(unittest.TestCase):
 
             self.assertEqual(exit_code, 0)
             self.assertFalse(profile_dir.exists())
-            self.assertFalse(index_path.exists())
+            self.assertFalse(account_state_dir.exists())
             self.assertTrue(browsers_dir.exists())
             self.assertIn("Deleted:", rendered)
             self.assertIn("gphoto-pull login", rendered)
@@ -417,10 +424,9 @@ class CliTests(unittest.TestCase):
         with TemporaryDirectory() as tmp_dir:
             config_path = Path(tmp_dir) / "gphoto-pull.toml"
             profile_dir = Path(tmp_dir) / "chrome-profile"
-            index_path = Path(tmp_dir) / "state" / "pull-state.sqlite3"
+            account_state_dir = Path(tmp_dir) / "state" / "accounts"
             profile_dir.mkdir()
-            index_path.parent.mkdir()
-            index_path.write_text("index", encoding="utf-8")
+            (account_state_dir / "account-key").mkdir(parents=True)
             config_path.write_text(
                 "\n".join(
                     [
@@ -439,7 +445,7 @@ class CliTests(unittest.TestCase):
 
             self.assertEqual(exit_code, 0)
             self.assertTrue(profile_dir.exists())
-            self.assertFalse(index_path.exists())
+            self.assertFalse(account_state_dir.exists())
             self.assertIn("Deleted:", rendered)
 
     def test_reset_browser_removes_profile_and_browser_install(self) -> None:
@@ -521,7 +527,31 @@ class IntegrationWorkflowTests(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         self.assertIn("login/session strategy", rendered)
         self.assertIn("gphoto-pull-profile", rendered)
+        self.assertIn("authenticated session", rendered)
+        self.assertIn("not checked", rendered)
         self.assertNotIn("CDP", rendered)
+
+    def test_doctor_dry_run_skips_authenticated_session_check(self) -> None:
+        config = ProjectConfig.from_sources(config_path=MISSING_CONFIG_PATH)
+
+        with (
+            patch("gphoto_pull.automation.collect_browser_checks", return_value=[]),
+            patch("gphoto_pull.automation.browser_profile_marked_logged_in", return_value=True),
+            patch.object(
+                GooglePhotosPuller,
+                "_check_authenticated_session_async",
+                side_effect=AssertionError("auth check should not launch"),
+            ),
+            io.StringIO() as stdout,
+            redirect_stdout(stdout),
+        ):
+            with patch("gphoto_pull.cli._load_config", return_value=config):
+                exit_code = main(["doctor", "--dry-run"])
+            rendered = stdout.getvalue()
+
+        self.assertEqual(exit_code, 0)
+        self.assertIn("authenticated session", rendered)
+        self.assertIn("--dry-run", rendered)
 
     def test_login_uses_persistent_profile_launch(self) -> None:
         config = ProjectConfig.from_sources(
@@ -529,10 +559,13 @@ class IntegrationWorkflowTests(unittest.TestCase):
             overrides=ConfigOverrides(browser_profile_dir="gphoto-pull-profile"),
         )
 
-        with patch(
-            "gphoto_pull.automation.interactive_login",
-            return_value=Path("gphoto-pull-profile"),
-        ) as login:
+        with (
+            patch(
+                "gphoto_pull.automation.interactive_login",
+                return_value=Path("gphoto-pull-profile"),
+            ) as login,
+            patch("gphoto_pull.automation.mark_browser_profile_logged_in") as marker,
+        ):
             service = GooglePhotosPuller(config)
             lines = service.login()
 
@@ -549,35 +582,12 @@ class IntegrationWorkflowTests(unittest.TestCase):
                 "?continue=https%3A%2F%2Fphotos.google.com%2F"
             ),
         )
+        marker.assert_called_once_with(Path("gphoto-pull-profile"))
         self.assertIn("Opened persistent browser profile", lines[0])
         self.assertIn("stored in that browser profile", lines[1])
 
-    def test_pull_dry_run_reports_persistent_profile_strategy(self) -> None:
-        with TemporaryDirectory() as tmp_dir:
-            config = ProjectConfig.from_sources(
-                config_path=MISSING_CONFIG_PATH,
-                overrides=ConfigOverrides(
-                    after="2026-01-02T03:04:05-08:00",
-                    sync_db_path=Path(tmp_dir) / "pull-state.sqlite3",
-                    browser_profile_dir=Path(tmp_dir) / "chrome-profile",
-                ),
-            )
+    def test_parse_args_rejects_pull_dry_run(self) -> None:
+        with self.assertRaises(SystemExit) as raised:
+            parse_args(["pull", "--dry-run"])
 
-            with (
-                patch("gphoto_pull.cli._load_config", return_value=config),
-                io.StringIO() as stderr,
-                redirect_stderr(stderr),
-            ):
-                exit_code = main(["pull", "--dry-run"])
-                rendered = stderr.getvalue()
-
-        self.assertEqual(exit_code, 0)
-        self.assertIn("Sync DB path:", rendered)
-        self.assertIn("Browser profile dir:", rendered)
-        self.assertIn("Login/session strategy:", rendered)
-        self.assertIn("Headless browser for pull: True", rendered)
-        self.assertIn("Photos UI scaffold is active", rendered)
-        self.assertIn("Known surface: Updates -> updates /updates", rendered)
-        self.assertIn("Saved updates artifact summary:", rendered)
-        self.assertIn("Dry-run enumeration candidates persisted:", rendered)
-        self.assertIn("Dry-run exact uploaded-time candidates:", rendered)
+        self.assertEqual(raised.exception.code, 2)
