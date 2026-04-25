@@ -10,13 +10,45 @@ from gphoto_pull.photos_ui import PhotosSurface, extract_photo_locations_from_ht
 from gphoto_pull.rpc_payloads import JsonValue
 from gphoto_pull.state import PullStateStore
 
-DIAGNOSTICS_DIR = Path(".state/diagnostics")
+RECENT_SEARCH_TOKEN = "synthetic-recent-token"
+VISIBLE_MEDIA_ID = "AF1QipVisibleMedia"
+PAYLOAD_ONLY_MEDIA_ID = "AF1QipPayloadOnlyItem"
+SHARED_CONTAINER_ID = "AF1QipSharedContainer"
+SHARED_MEDIA_ID = "AF1QipSharedMedia"
+ACTOR_ID = "AF1QipSyntheticActor"
+
+RECENT_HTML = f"""
+<html>
+  <script>'ds:1':{{id:'eNG3nf'}}</script>
+  <a href="https://photos.google.com/search/{RECENT_SEARCH_TOKEN}">Canonical recent route</a>
+  <a href="./search/{RECENT_SEARCH_TOKEN}" aria-label="Recently added">Recently added</a>
+  <a
+    href="./search/{RECENT_SEARCH_TOKEN}/photo/{VISIBLE_MEDIA_ID}"
+    aria-label="Photo - Apr 10, 2026, 1:01:49 PM"
+  >
+    Visible photo
+  </a>
+</html>
+"""
+
+UPDATES_HTML = f"""
+<html>
+  <a href="./share/{SHARED_CONTAINER_ID}/photo/{SHARED_MEDIA_ID}">Shared photo</a>
+</html>
+"""
 
 
 def _recent_batchexecute_frame(items: list[list[JsonValue]]) -> str:
     payload_text = msgspec.json.encode([items]).decode()
     return msgspec.json.encode(
         [["wrb.fr", "opaqueRecentRpc", payload_text, None, None, None]]
+    ).decode()
+
+
+def _updates_batchexecute_frame(activities: list[list[JsonValue]]) -> str:
+    payload_text = msgspec.json.encode([None, activities]).decode()
+    return msgspec.json.encode(
+        [["wrb.fr", "opaqueUpdatesRpc", payload_text, None, None, None]]
     ).decode()
 
 
@@ -27,13 +59,9 @@ class SavedEnumerationTests(unittest.TestCase):
         (diagnostics_dir / "live_recent_probe").mkdir(parents=True)
         (diagnostics_dir / "live_updates_probe").mkdir(parents=True)
 
-        recent_html = (DIAGNOSTICS_DIR / "recent_probe" / "recent.html").read_text(encoding="utf-8")
-        updates_html = (DIAGNOSTICS_DIR / "updates-page.html").read_text(encoding="utf-8")
-        updates_payload = (DIAGNOSTICS_DIR / "updates-frGlJf.txt").read_text(encoding="utf-8")
-
         recent_locations = [
             location
-            for location in extract_photo_locations_from_html(recent_html)
+            for location in extract_photo_locations_from_html(RECENT_HTML)
             if (
                 location.surface is PhotosSurface.SEARCH_MEDIA_DETAIL
                 and location.media_id is not None
@@ -42,9 +70,9 @@ class SavedEnumerationTests(unittest.TestCase):
         first_media_id = recent_locations[0].media_id
         assert first_media_id is not None
 
-        (diagnostics_dir / "recent_probe" / "recent.html").write_text(recent_html, encoding="utf-8")
+        (diagnostics_dir / "recent_probe" / "recent.html").write_text(RECENT_HTML, encoding="utf-8")
         (diagnostics_dir / "live_recent_probe" / "recent.html").write_text(
-            recent_html,
+            RECENT_HTML,
             encoding="utf-8",
         )
         (diagnostics_dir / "live_recent_probe" / "resp_01.txt").write_text(
@@ -59,7 +87,7 @@ class SavedEnumerationTests(unittest.TestCase):
                         1775934657629,
                     ],
                     [
-                        "AF1QipPayloadOnlyItem",
+                        PAYLOAD_ONLY_MEDIA_ID,
                         ["https://example.invalid/payload-only", 4000, 3000],
                         1774000000000,
                         "opaque-payload-only",
@@ -71,11 +99,18 @@ class SavedEnumerationTests(unittest.TestCase):
             encoding="utf-8",
         )
         (diagnostics_dir / "live_updates_probe" / "updates.html").write_text(
-            updates_html,
+            UPDATES_HTML,
             encoding="utf-8",
         )
         (diagnostics_dir / "live_updates_probe" / "resp_01.txt").write_text(
-            updates_payload,
+            _updates_batchexecute_frame(
+                [
+                    [
+                        f"ai:1774100000:opaque:{SHARED_CONTAINER_ID}:{ACTOR_ID}",
+                        1774000000000,
+                    ],
+                ]
+            ),
             encoding="utf-8",
         )
 
@@ -156,7 +191,7 @@ class SavedEnumerationTests(unittest.TestCase):
 
         self.assertTrue(
             any(
-                candidate.metadata.media_id == "AF1QipPayloadOnlyItem"
+                candidate.metadata.media_id == PAYLOAD_ONLY_MEDIA_ID
                 and candidate.cutoff_match is True
                 for candidate in summary.candidates
             )

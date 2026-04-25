@@ -9,9 +9,15 @@
 uploaded or shared inside a date/time window. It uses Playwright with an app-owned persistent
 Chromium profile, so the normal flow is manual Google login once and headless pulls after that.
 
-Google Photos is not a stable public API. This project treats the browser session, downloaded
-files, diagnostics, and sync database as local runtime state and keeps enough diagnostics to debug
-site drift.
+This tool is intended to complement, not replace, Google Takeout. Use Google Takeout first to make
+a full backup of your Google Photos library, then use `gphoto-pull` for incremental syncs on top of
+that baseline.
+
+Google Photos is not a stable public API, and automating interaction with Google Photos is probably
+against Google's terms of service. The workflow is brittle and can break when Google changes the
+site. The project maintainers take no responsibility for what happens to your Google account if you
+use `gphoto-pull`. This project treats the browser session, downloaded files, diagnostics, and sync
+database as local runtime state and keeps enough diagnostics to debug site drift.
 
 ## Install
 
