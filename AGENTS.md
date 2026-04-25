@@ -20,7 +20,7 @@ Tests live in `tests/` and run under `pytest`. Generated or local-only paths inc
 - `uv run gphoto-pull config` writes a local `gphoto-pull.toml` interactively.
 - `uv run gphoto-pull doctor` checks local config and prerequisites.
 - `uv run gphoto-pull login` opens the persistent browser profile for manual Google login.
-- `uv run gphoto-pull pull --after 2026-01-01T00:00:00-08:00 --dry-run` prints the planned run without browser automation.
+- `uv run gphoto-pull pull --after 2026-01-01T00:00:00-08:00` runs a pull for a date window.
 - `just lint` runs Ruff format check, Ruff lint, and Pyright.
 - `just test` runs pytest. Extra args pass through, e.g. `just test tests/test_config.py`.
 - `just check` runs lint, tests, and `uv build`.

@@ -123,7 +123,12 @@ class DoctorCommand:
 
     Description:
         Validates local prerequisites and config.
+
+    Attributes:
+        dry_run: Skip live browser authentication checks.
     """
+
+    dry_run: bool = False
 
 
 @dataclass(slots=True)
@@ -160,7 +165,6 @@ class PullCommand:
         headed: Show the pull browser instead of running headless.
         enrich_metadata: Enable post-download detail metadata enrichment for this run.
         no_enrich_metadata: Disable post-download detail metadata enrichment for this run.
-        dry_run: Enumerate/report without starting downloads.
     """
 
     after: str | None = None
@@ -171,7 +175,6 @@ class PullCommand:
     headed: bool = False
     enrich_metadata: Annotated[bool, tyro.conf.FlagCreatePairsOff] = False
     no_enrich_metadata: Annotated[bool, tyro.conf.FlagCreatePairsOff] = False
-    dry_run: bool = False
 
 
 @dataclass(slots=True)
@@ -694,12 +697,7 @@ def _reset_paths_for_target(config: ProjectConfig, *, target: str) -> tuple[Path
         Paths to delete for the target.
     """
 
-    index_paths = (
-        config.sync_db_path,
-        config.sync_db_path.with_name(f"{config.sync_db_path.name}-wal"),
-        config.sync_db_path.with_name(f"{config.sync_db_path.name}-shm"),
-        config.sync_db_path.with_name(f"{config.sync_db_path.name}-journal"),
-    )
+    index_paths = (config.sync_db_path.parent / "accounts",)
 
     if target == "all":
         return (config.browser_profile_dir, *index_paths)
@@ -754,12 +752,13 @@ def _run_reset_command(config: ProjectConfig, command: ResetCommand) -> int:
     return 0
 
 
-def _run_doctor(service: GooglePhotosPuller) -> int:
+def _run_doctor(service: GooglePhotosPuller, *, dry_run: bool) -> int:
     """Description:
     Execute the `doctor` service command.
 
     Args:
         service: Application service.
+        dry_run: Skip live browser authentication checks.
 
     Returns:
         Process-style exit code.
@@ -768,19 +767,18 @@ def _run_doctor(service: GooglePhotosPuller) -> int:
         Prints doctor checks.
     """
 
-    for check in service.doctor():
+    for check in service.doctor(dry_run=dry_run):
         status = "WARN" if check.warning else "OK" if check.ok else "MISSING"
         print(f"[{status}] {check.name}: {check.detail}")
     return 0
 
 
-def _run_pull(service: GooglePhotosPuller, *, dry_run: bool) -> int:
+def _run_pull(service: GooglePhotosPuller) -> int:
     """Description:
     Execute the `pull` service command.
 
     Args:
         service: Application service.
-        dry_run: Whether to report without downloading.
 
     Returns:
         Process-style exit code.
@@ -789,9 +787,8 @@ def _run_pull(service: GooglePhotosPuller, *, dry_run: bool) -> int:
         Runs the pull workflow and prints result lines.
     """
 
-    lines = service.pull(dry_run=dry_run)
-    label = "Dry run plan" if dry_run else "Pull result"
-    print(label, file=sys.stderr)
+    lines = service.pull()
+    print("Pull result", file=sys.stderr)
     for line in lines:
         print(f"- {line}", file=sys.stderr)
     return 0
@@ -814,9 +811,10 @@ def _run_refresh(config: ProjectConfig, service: GooglePhotosPuller, *, reset: b
         result lines to stderr.
     """
 
-    if reset and config.sync_db_path.exists():
-        config.sync_db_path.unlink()
-        print(f"Deleted media index: {config.sync_db_path}", file=sys.stderr)
+    account_state_dir = config.sync_db_path.parent / "accounts"
+    if reset and account_state_dir.exists():
+        shutil.rmtree(account_state_dir)
+        print(f"Deleted media index: {account_state_dir}", file=sys.stderr)
     lines = service.refresh()
     print("Refresh result", file=sys.stderr)
     for line in lines:
@@ -868,11 +866,11 @@ def _run_service_command(args: CliArgs) -> int:
 
     service = GooglePhotosPuller(config)
     if isinstance(command, DoctorCommand):
-        return _run_doctor(service)
+        return _run_doctor(service, dry_run=command.dry_run)
     if isinstance(command, LoginCommand):
         return _run_login(service)
     if isinstance(command, PullCommand):
-        return _run_pull(service, dry_run=command.dry_run)
+        return _run_pull(service)
     if isinstance(command, RefreshCommand):
         return _run_refresh(config, service, reset=command.reset)
 

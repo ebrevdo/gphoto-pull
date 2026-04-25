@@ -40,7 +40,6 @@ gphoto-pull config --defaults
 gphoto-pull install-browser
 gphoto-pull doctor
 gphoto-pull login
-gphoto-pull pull --after 2026-01-01T00:00:00-08:00 --dry-run
 gphoto-pull pull --after "Jan 1 2026" --before "Feb 1 2026"
 ```
 
@@ -81,7 +80,6 @@ current working directory.
 - `gphoto-pull login`: launch the persistent headed browser profile for manual login.
 - `gphoto-pull refresh --after TIMESTAMP`: refresh the local media index without downloading.
 - `gphoto-pull refresh --after TIMESTAMP --reset`: delete and rebuild the local media index.
-- `gphoto-pull pull --dry-run --after TIMESTAMP`: inspect config and enumeration without downloading.
 - `gphoto-pull pull --after START --before END`: enumerate and download originals in a window.
 - `gphoto-pull reset --yes`: delete the persistent browser profile and local media index.
 - `gphoto-pull reset --target index --yes`: delete only the local media index.
