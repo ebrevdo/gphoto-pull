@@ -127,10 +127,11 @@ def _parse_datetime_field(
         if value == "":
             return None
         try:
+            default = _datetime_parse_default(value)
             parsed = parse_datetime(
                 value,
                 fuzzy=False,
-                default=datetime.now().replace(hour=0, minute=0, second=0, microsecond=0),
+                default=default,
             )
         except (ParserError, OverflowError) as exc:
             raise ConfigError(
@@ -144,6 +145,22 @@ def _parse_datetime_field(
     if parsed.tzinfo.utcoffset(parsed) is None:
         return parsed.replace(tzinfo=None).astimezone()
     return parsed
+
+
+def _datetime_parse_default(value: str) -> datetime:
+    now = datetime.now()
+    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    if _is_time_only_datetime(value):
+        return today_start
+    return today_start.replace(month=1, day=1)
+
+
+def _is_time_only_datetime(value: str) -> bool:
+    first_default = datetime(2001, 1, 1, 0, 0, 0, 0)
+    second_default = datetime(2002, 2, 2, 0, 0, 0, 0)
+    first = parse_datetime(value, fuzzy=False, default=first_default)
+    second = parse_datetime(value, fuzzy=False, default=second_default)
+    return first.year != second.year and first.month != second.month and first.day != second.day
 
 
 def _parse_positive_int(raw: int | None, *, default: int, field_name: str) -> int:
