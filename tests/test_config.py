@@ -119,6 +119,39 @@ class ProjectConfigTests(unittest.TestCase):
         self.assertEqual(config.before.month, 4)
         self.assertEqual(config.before.day, 18)
 
+    def test_from_sources_uses_period_start_for_dates_without_day_or_month(self) -> None:
+        config = ProjectConfig.from_sources(
+            overrides=ConfigOverrides(after="jun 2026", before="2027"),
+        )
+
+        assert config.after is not None
+        assert config.before is not None
+        self.assertEqual(config.after.year, 2026)
+        self.assertEqual(config.after.month, 6)
+        self.assertEqual(config.after.day, 1)
+        self.assertEqual(config.after.hour, 0)
+        self.assertEqual(config.before.year, 2027)
+        self.assertEqual(config.before.month, 1)
+        self.assertEqual(config.before.day, 1)
+        self.assertEqual(config.before.hour, 0)
+
+    def test_from_sources_uses_today_start_for_times_without_dates(self) -> None:
+        today = datetime.now().date()
+        config = ProjectConfig.from_sources(
+            overrides=ConfigOverrides(after="12pm", before="12:30pm"),
+        )
+
+        assert config.after is not None
+        assert config.before is not None
+        self.assertEqual(config.after.date(), today)
+        self.assertEqual(config.after.hour, 12)
+        self.assertEqual(config.after.minute, 0)
+        self.assertEqual(config.after.second, 0)
+        self.assertEqual(config.before.date(), today)
+        self.assertEqual(config.before.hour, 12)
+        self.assertEqual(config.before.minute, 30)
+        self.assertEqual(config.before.second, 0)
+
     def test_from_sources_rejects_before_on_or_before_after(self) -> None:
         with self.assertRaisesRegex(ConfigError, "before.*after"):
             ProjectConfig.from_sources(
