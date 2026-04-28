@@ -9,6 +9,17 @@ versioned section. The first release tag is `v0.0.1`.
 
 - Nothing yet.
 
+## v0.0.3
+
+- Added support for running the app-owned Chromium session as root in containerized
+  environments.
+- Changed partial date cutoffs to default to the start of their implied period.
+- Changed pulls to refresh live upload diagnostics before relying on indexed media.
+- Changed the media index to track trusted upload coverage ranges and skip live
+  diagnostics for bounded windows already covered by the local index.
+- Fixed duplicate downloads after `reset --target index` by matching existing
+  Takeout-style sidecars back to their Google Photos media IDs.
+
 ## v0.0.2
 
 - Added CI, release, lint, typecheck, test, and packaging workflows.
