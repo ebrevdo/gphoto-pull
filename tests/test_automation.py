@@ -1042,6 +1042,45 @@ class DownloadTraceTests(unittest.TestCase):
 
             self.assertTrue(_target_path_exists(record, download_dir=download_dir))
 
+    def test_target_path_exists_recovers_reset_index_download_from_sidecar(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            download_dir = Path(tmp_dir) / "downloads"
+            existing = download_dir / "uploaded" / "2026" / "04" / "19" / "IMG_0001.JPG"
+            existing.parent.mkdir(parents=True)
+            existing.write_bytes(b"image")
+            existing.with_name("IMG_0001.JPG.supplemental-metadata.json").write_bytes(
+                msgspec.json.encode(
+                    {"url": "https://photos.google.com/search/_tra_/photo/AF1QipSame"}
+                )
+            )
+            record = MediaStateRecord(
+                metadata=MediaMetadata(
+                    media_id="AF1QipSame",
+                    filename="unresolved-AF1QipSame",
+                    uploaded_time=datetime(2026, 4, 19, tzinfo=UTC),
+                )
+            )
+
+            self.assertTrue(_target_path_exists(record, download_dir=download_dir))
+
+    def test_target_path_exists_ignores_matching_sidecar_without_media_file(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            download_dir = Path(tmp_dir) / "downloads"
+            sidecar_dir = download_dir / "uploaded" / "2026" / "04" / "19"
+            sidecar_dir.mkdir(parents=True)
+            (sidecar_dir / "IMG_0001.JPG.supplemental-metadata.json").write_bytes(
+                msgspec.json.encode({"url": "https://photos.google.com/photo/AF1QipSame"})
+            )
+            record = MediaStateRecord(
+                metadata=MediaMetadata(
+                    media_id="AF1QipSame",
+                    filename="unresolved-AF1QipSame",
+                    uploaded_time=datetime(2026, 4, 19, tzinfo=UTC),
+                )
+            )
+
+            self.assertFalse(_target_path_exists(record, download_dir=download_dir))
+
     def test_target_path_exists_does_not_skip_different_media_collision(self) -> None:
         with TemporaryDirectory() as tmp_dir:
             download_dir = Path(tmp_dir) / "downloads"
