@@ -349,10 +349,12 @@ class _RecentPayloadStats:
     Attributes:
         media_ids: Unique media ids seen so far.
         oldest_upload_time: Oldest upload timestamp seen so far.
+        newest_upload_time: Newest upload timestamp seen so far.
     """
 
     media_ids: set[str]
     oldest_upload_time: datetime | None = None
+    newest_upload_time: datetime | None = None
 
     @property
     def item_count(self) -> int:
@@ -397,10 +399,13 @@ class _RecentPaginationResult:
         completed: Whether pagination reached a normal stop condition.
         checkpoint_invalid: Whether a checkpoint path should be retried from
             the normal first-page cursor.
+        fetched_response_texts: Raw response texts fetched by this pagination
+            attempt, excluding texts that were already in the capture.
     """
 
     completed: bool
     checkpoint_invalid: bool = False
+    fetched_response_texts: tuple[str, ...] = ()
 
 
 class GooglePhotosPuller:
@@ -742,35 +747,46 @@ class GooglePhotosPuller:
             if self.config.after is None:
                 raise ConfigError("`after` is required before running a pull.")
             with PullStateStore(state_db_path) as state_store:
-                stop_on_index_overlap = state_store.upload_coverage_satisfies(self.config.after)
-                LOGGER.log(PHASE_LOG_LEVEL, "Capturing Recently added diagnostics.")
-                recent_page = await context.new_page()
-                recent_response_count = await _capture_recent_probe_async(
-                    recent_page,
-                    diagnostics_dir=self.config.diagnostics_dir,
-                    photos_ui=self.photos_ui,
+                if state_store.upload_window_satisfies(
                     after=self.config.after,
-                    state_store=state_store,
-                    stop_on_index_overlap=stop_on_index_overlap,
-                    allow_checkpoint_resume=False,
-                )
-                await recent_page.close()
+                    before=self.config.before,
+                ):
+                    LOGGER.log(
+                        PHASE_LOG_LEVEL,
+                        "Bounded upload window is covered by the media index; "
+                        "skipping live diagnostics.",
+                    )
+                    lines.append("Indexed window coverage: complete; skipping live diagnostics")
+                else:
+                    stop_on_index_overlap = state_store.upload_coverage_satisfies(self.config.after)
+                    LOGGER.log(PHASE_LOG_LEVEL, "Capturing Recently added diagnostics.")
+                    recent_page = await context.new_page()
+                    recent_response_count = await _capture_recent_probe_async(
+                        recent_page,
+                        diagnostics_dir=self.config.diagnostics_dir,
+                        photos_ui=self.photos_ui,
+                        after=self.config.after,
+                        state_store=state_store,
+                        stop_on_index_overlap=stop_on_index_overlap,
+                        allow_checkpoint_resume=False,
+                    )
+                    await recent_page.close()
 
-                LOGGER.log(PHASE_LOG_LEVEL, "Capturing Updates diagnostics.")
-                updates_page = await context.new_page()
-                updates_response_count = await _capture_updates_probe_async(
-                    updates_page,
-                    diagnostics_dir=self.config.diagnostics_dir,
-                )
-                await updates_page.close()
+                    LOGGER.log(PHASE_LOG_LEVEL, "Capturing Updates diagnostics.")
+                    updates_page = await context.new_page()
+                    updates_response_count = await _capture_updates_probe_async(
+                        updates_page,
+                        diagnostics_dir=self.config.diagnostics_dir,
+                    )
+                    await updates_page.close()
 
-                lines.append(
-                    "Captured live diagnostics: "
-                    f"recent batchexecute responses={recent_response_count}, "
-                    f"updates batchexecute responses={updates_response_count}"
-                )
+                    lines.append(
+                        "Captured live diagnostics: "
+                        f"recent batchexecute responses={recent_response_count}, "
+                        f"updates batchexecute responses={updates_response_count}"
+                    )
 
-                LOGGER.log(PHASE_LOG_LEVEL, "Querying refreshed media index.")
+                LOGGER.log(PHASE_LOG_LEVEL, "Querying media index.")
                 records = state_store.list_media_in_upload_window(
                     after=self.config.after,
                     before=self.config.before,
@@ -1135,6 +1151,7 @@ async def _capture_recent_probe_async(
 
         stable_iterations = 0
         scroll_iterations = 0
+        coverage_recorded = False
         previous_payload_count = _recent_payload_item_count(capture.response_texts)
         previous_visible_count = await photos_ui.visible_recent_media_count_async(page)
         while True:
@@ -1152,6 +1169,7 @@ async def _capture_recent_probe_async(
             if stop_on_index_overlap and _recent_payloads_overlap_index(
                 capture.response_texts,
                 state_store,
+                after=after,
             ):
                 LOGGER.log(
                     PHASE_LOG_LEVEL,
@@ -1174,6 +1192,7 @@ async def _capture_recent_probe_async(
                 stop_on_index_overlap=stop_on_index_overlap,
                 allow_checkpoint_resume=allow_checkpoint_resume,
             ):
+                coverage_recorded = True
                 break
 
             scrolled = await photos_ui.scroll_recently_added_container_async(page)
@@ -1226,7 +1245,9 @@ async def _capture_recent_probe_async(
                 )
 
         await _flush_response_capture(capture)
-        _persist_recent_payloads_from_responses(state_store, capture.response_texts)
+        if not coverage_recorded:
+            _persist_recent_payloads_from_responses(state_store, capture.response_texts)
+            _record_recent_payload_coverage(state_store, capture.response_texts)
         _reset_capture_dir(target_dir)
         await _write_probe_artifacts_async(
             page=page,
@@ -1647,7 +1668,7 @@ async def _page_recent_payloads_to_window(
 
     Side Effects:
         Posts captured recent-media batchexecute requests and appends response
-        texts.
+        texts. Records upload coverage for completed contiguous page chains.
     """
 
     await _flush_response_capture(capture)
@@ -1660,6 +1681,7 @@ async def _page_recent_payloads_to_window(
     if normal_cursor is None:
         return False
 
+    initial_response_texts = tuple(capture.response_texts)
     current_rpc_ids = tuple(dict.fromkeys(request.rpc_id for request in recent_page_requests))
     checkpoint = (
         state_store.best_recent_page_checkpoint(after=after, rpc_ids=current_rpc_ids)
@@ -1701,22 +1723,40 @@ async def _page_recent_payloads_to_window(
                 checkpoint_invalid=True,
             )
         if checkpoint_result.completed:
+            _persist_recent_payloads_from_responses(state_store, list(initial_response_texts))
+            _record_recent_payload_coverage(state_store, initial_response_texts)
+            _persist_recent_payloads_from_responses(
+                state_store,
+                list(checkpoint_result.fetched_response_texts),
+            )
+            _record_recent_payload_coverage(
+                state_store,
+                checkpoint_result.fetched_response_texts,
+            )
             return True
         if not checkpoint_result.checkpoint_invalid:
             return False
+        if checkpoint_result.fetched_response_texts:
+            del capture.response_texts[-len(checkpoint_result.fetched_response_texts) :]
         LOGGER.log(PHASE_LOG_LEVEL, "Recent direct checkpoint ignored for this run.")
 
-    return (
-        await _page_recent_payloads_from_start(
-            request_context,
-            capture,
-            recent_page_requests,
-            start=_RecentPaginationStart(cursor=normal_cursor, page_count=0),
-            after=after,
-            state_store=state_store,
-            stop_on_index_overlap=stop_on_index_overlap,
+    normal_result = await _page_recent_payloads_from_start(
+        request_context,
+        capture,
+        recent_page_requests,
+        start=_RecentPaginationStart(cursor=normal_cursor, page_count=0),
+        after=after,
+        state_store=state_store,
+        stop_on_index_overlap=stop_on_index_overlap,
+    )
+    if normal_result.completed:
+        coverage_response_texts = (*initial_response_texts, *normal_result.fetched_response_texts)
+        _persist_recent_payloads_from_responses(state_store, list(coverage_response_texts))
+        _record_recent_payload_coverage(
+            state_store,
+            coverage_response_texts,
         )
-    ).completed
+    return normal_result.completed
 
 
 async def _page_recent_payloads_from_start(
@@ -1767,6 +1807,7 @@ async def _page_recent_payloads_from_start(
     stats = _recent_payload_stats(capture.response_texts)
     previous_item_count = stats.item_count
     seen_cursors: set[str] = set()
+    fetched_response_texts: list[str] = []
     while cursor is not None:
         raise_if_interrupt_requested()
         if cursor.cursor in seen_cursors:
@@ -1779,6 +1820,7 @@ async def _page_recent_payloads_from_start(
             return _RecentPaginationResult(
                 completed=not start.from_checkpoint,
                 checkpoint_invalid=start.from_checkpoint,
+                fetched_response_texts=tuple(fetched_response_texts),
             )
         seen_cursors.add(cursor.cursor)
         if request_template.rpc_id != cursor.rpc_id:
@@ -1790,6 +1832,7 @@ async def _page_recent_payloads_from_start(
                 return _RecentPaginationResult(
                     completed=False,
                     checkpoint_invalid=start.from_checkpoint,
+                    fetched_response_texts=tuple(fetched_response_texts),
                 )
             request_template = next_template
         raw_text = await _fetch_recent_page(
@@ -1800,8 +1843,10 @@ async def _page_recent_payloads_from_start(
         overlaps_index = stop_on_index_overlap and _recent_payload_overlaps_index(
             raw_text,
             state_store,
+            after=after,
         )
         capture.response_texts.append(raw_text)
+        fetched_response_texts.append(raw_text)
         page_count += 1
 
         _update_recent_payload_stats(stats, raw_text)
@@ -1835,9 +1880,15 @@ async def _page_recent_payloads_from_start(
                 page_count,
                 stats.item_count,
             )
-            return _RecentPaginationResult(completed=True)
+            return _RecentPaginationResult(
+                completed=True,
+                fetched_response_texts=tuple(fetched_response_texts),
+            )
         if stats.oldest_upload_time is not None and stats.oldest_upload_time < after:
-            return _RecentPaginationResult(completed=True)
+            return _RecentPaginationResult(
+                completed=True,
+                fetched_response_texts=tuple(fetched_response_texts),
+            )
         if no_progress_pages >= 5:
             LOGGER.log(
                 PHASE_LOG_LEVEL,
@@ -1855,9 +1906,13 @@ async def _page_recent_payloads_from_start(
             return _RecentPaginationResult(
                 completed=not start.from_checkpoint,
                 checkpoint_invalid=start.from_checkpoint,
+                fetched_response_texts=tuple(fetched_response_texts),
             )
 
-    return _RecentPaginationResult(completed=True)
+    return _RecentPaginationResult(
+        completed=True,
+        fetched_response_texts=tuple(fetched_response_texts),
+    )
 
 
 def _store_recent_page_checkpoint(
@@ -1895,7 +1950,6 @@ def _store_recent_page_checkpoint(
     if not upload_times:
         return
     oldest_upload_time = min(upload_times)
-    state_store.advance_upload_coverage(oldest_upload_time)
     state_store.upsert_recent_page_checkpoint(
         rpc_id=cursor.rpc_id,
         cursor=cursor.cursor,
@@ -1917,26 +1971,44 @@ def _persist_recent_payloads_from_responses(
         response_texts: Raw recent-media response bodies.
 
     Side Effects:
-        Upserts media rows and advances upload coverage when timestamps exist.
+        Upserts media rows.
     """
 
     if state_store is None:
         return
 
-    upload_times: list[datetime] = []
     for raw_text in response_texts:
         try:
             payload = parse_recent_payload(raw_text)
         except RpcPayloadParseError:
             continue
         _persist_recent_payload_page(state_store, payload)
-        upload_times.extend(
-            datetime.fromtimestamp(item.upload_timestamp_ms / 1000, tz=UTC)
-            for item in payload.items
-            if item.upload_timestamp_ms is not None
-        )
-    if upload_times:
-        state_store.advance_upload_coverage(min(upload_times))
+
+
+def _record_recent_payload_coverage(
+    state_store: PullStateStore | None,
+    response_texts: tuple[str, ...] | list[str],
+) -> None:
+    """Description:
+    Record coverage from one contiguous Recent feed response chain.
+
+    Args:
+        state_store: Optional media index.
+        response_texts: Raw response bodies from one contiguous traversal.
+
+    Side Effects:
+        Writes or merges one trusted upload coverage range when timestamps exist.
+    """
+
+    if state_store is None:
+        return
+    stats = _recent_payload_stats(list(response_texts))
+    if stats.oldest_upload_time is None or stats.newest_upload_time is None:
+        return
+    state_store.record_upload_coverage(
+        oldest_upload_time=stats.oldest_upload_time,
+        newest_upload_time=stats.newest_upload_time,
+    )
 
 
 def _persist_recent_payload_page(state_store: PullStateStore, payload: RecentPayload) -> None:
@@ -1981,36 +2053,45 @@ def _persist_recent_payload_page(state_store: PullStateStore, payload: RecentPay
 def _recent_payloads_overlap_index(
     response_texts: list[str],
     state_store: PullStateStore | None,
+    *,
+    after: datetime,
 ) -> bool:
     """Description:
-    Check whether captured recent-media payloads overlap existing index rows.
+    Check whether captured recent payloads reached trusted indexed coverage.
 
     Args:
         response_texts: Raw batchexecute response bodies.
         state_store: Optional media index to check.
+        after: Requested lower-bound timestamp.
 
     Returns:
-        `True` when any captured media id already existed in the index with a
-        known upload timestamp.
+        `True` when any captured upload timestamp is inside a trusted coverage
+        range that extends through `after`.
     """
 
-    return any(_recent_payload_overlaps_index(raw_text, state_store) for raw_text in response_texts)
+    return any(
+        _recent_payload_overlaps_index(raw_text, state_store, after=after)
+        for raw_text in response_texts
+    )
 
 
 def _recent_payload_overlaps_index(
     raw_text: str,
     state_store: PullStateStore | None,
+    *,
+    after: datetime,
 ) -> bool:
     """Description:
-    Check whether one recent-media payload overlaps existing index rows.
+    Check whether one recent payload reached trusted indexed coverage.
 
     Args:
         raw_text: Raw batchexecute response body.
         state_store: Optional media index to check.
+        after: Requested lower-bound timestamp.
 
     Returns:
-        `True` when the payload contains a media id already indexed with a known
-        upload timestamp.
+        `True` when the payload contains an upload timestamp inside a trusted
+        coverage range that extends through `after`.
     """
 
     if state_store is None:
@@ -2020,8 +2101,10 @@ def _recent_payload_overlaps_index(
     except RpcPayloadParseError:
         return False
     for item in payload.items:
-        record = state_store.get_media(item.media_id)
-        if record is not None and record.metadata.uploaded_time is not None:
+        if item.upload_timestamp_ms is None:
+            continue
+        uploaded_time = datetime.fromtimestamp(item.upload_timestamp_ms / 1000, tz=UTC)
+        if state_store.upload_time_has_covering_range(uploaded_time=uploaded_time, after=after):
             return True
     return False
 
@@ -2066,6 +2149,8 @@ def _update_recent_payload_stats(stats: _RecentPayloadStats, raw_text: str) -> N
         upload_time = datetime.fromtimestamp(item.upload_timestamp_ms / 1000, tz=UTC)
         if stats.oldest_upload_time is None or upload_time < stats.oldest_upload_time:
             stats.oldest_upload_time = upload_time
+        if stats.newest_upload_time is None or upload_time > stats.newest_upload_time:
+            stats.newest_upload_time = upload_time
 
 
 def _recent_page_request_for_rpc_id(

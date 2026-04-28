@@ -16,7 +16,12 @@ from types import TracebackType
 from gphoto_pull.models import MediaMetadata, MediaStateRecord, SyncCheckpoint
 
 DEFAULT_STATE_DB_PATH = Path(".state/pull-state.sqlite3")
-UPLOAD_COVERAGE_CHECKPOINT = "recent-upload-indexed-through"
+STATE_SCHEMA_VERSION = 2
+RESET_INDEX_COMMAND = "gphoto-pull reset --target index --yes"
+
+
+class StateSchemaError(RuntimeError):
+    """Incompatible media index schema that needs an explicit user reset."""
 
 
 def _require_datetime(value: datetime | None, *, field_name: str) -> datetime:
@@ -34,6 +39,24 @@ def _require_datetime(value: datetime | None, *, field_name: str) -> datetime:
     if value is None:
         raise ValueError(f"{field_name} is missing from persisted state.")
     return value
+
+
+def _reset_required_message(db_path: Path) -> str:
+    """Description:
+    Build the user-facing reset instruction for incompatible state databases.
+
+    Args:
+        db_path: Incompatible database path.
+
+    Returns:
+        Error message with a concrete reset command.
+    """
+
+    return (
+        f"{db_path} uses an older media index schema that cannot be upgraded safely. "
+        "Stop any running gphoto-pull process, run "
+        f"`{RESET_INDEX_COMMAND}`, then rerun your pull or refresh command."
+    )
 
 
 def _merge_media_metadata(existing: MediaMetadata, incoming: MediaMetadata) -> MediaMetadata:
@@ -129,7 +152,7 @@ class PullStateStore:
 
         Side Effects:
             Creates the database parent directory, opens SQLite, enables foreign
-            keys, and initializes/migrates schema.
+            keys, and initializes the current schema.
         """
 
         self.db_path = Path(db_path)
@@ -137,7 +160,11 @@ class PullStateStore:
         self._connection = sqlite3.connect(self.db_path)
         self._connection.row_factory = sqlite3.Row
         self._connection.execute("PRAGMA foreign_keys = ON")
-        self.initialize()
+        try:
+            self.initialize()
+        except Exception:
+            self._connection.close()
+            raise
 
     def __enter__(self) -> PullStateStore:
         """Description:
@@ -181,10 +208,38 @@ class PullStateStore:
 
     def initialize(self) -> None:
         """Description:
-        Create or migrate tables used by the local index.
+        Create or validate tables used by the local index.
 
         Side Effects:
-            Writes SQLite schema changes when required.
+            Writes the current schema for new databases.
+        """
+
+        table_names = self._table_names()
+        if not table_names:
+            self._create_current_schema()
+            return
+
+        schema_version = self._schema_version()
+        if schema_version != STATE_SCHEMA_VERSION:
+            raise StateSchemaError(_reset_required_message(self.db_path))
+
+        required_tables = {
+            "media_state",
+            "recent_page_checkpoints",
+            "sync_checkpoints",
+            "upload_coverage_ranges",
+        }
+        if not required_tables.issubset(table_names):
+            raise StateSchemaError(_reset_required_message(self.db_path))
+
+        self._ensure_current_indexes()
+
+    def _create_current_schema(self) -> None:
+        """Description:
+        Create the current media index schema.
+
+        Side Effects:
+            Writes SQLite tables, indexes, and schema version metadata.
         """
 
         with self._connection:
@@ -220,60 +275,78 @@ class PullStateStore:
                     page_count INTEGER NOT NULL,
                     created_at TEXT NOT NULL
                 );
-                """
-            )
-            self._ensure_media_state_schema()
-            self._connection.execute(
-                """
-                CREATE INDEX IF NOT EXISTS idx_media_state_uploaded_time
-                    ON media_state (uploaded_time DESC, media_id)
-                """
-            )
-            self._connection.execute(
-                """
-                CREATE INDEX IF NOT EXISTS idx_recent_page_checkpoints_oldest
-                    ON recent_page_checkpoints (oldest_upload_time ASC, rpc_id)
-                """
-            )
 
-    def _ensure_media_state_schema(self) -> None:
+                CREATE TABLE IF NOT EXISTS upload_coverage_ranges (
+                    oldest_upload_time TEXT NOT NULL,
+                    newest_upload_time TEXT NOT NULL,
+                    CHECK (oldest_upload_time <= newest_upload_time)
+                );
+                """
+            )
+            self._ensure_current_indexes()
+            self._connection.execute(f"PRAGMA user_version = {STATE_SCHEMA_VERSION}")
+
+    def _schema_version(self) -> int:
         """Description:
-        Add columns required by newer versions of the media index schema.
-
-        Side Effects:
-            Executes `ALTER TABLE` statements for missing columns.
-        """
-
-        expected_columns = (
-            ("uploaded_time", "TEXT"),
-            ("preview_url", "TEXT"),
-        )
-        for column_name, column_type in expected_columns:
-            if self._media_state_has_column(column_name):
-                continue
-            self._connection.execute(
-                f"""
-                ALTER TABLE media_state
-                ADD COLUMN {column_name} {column_type}
-                """
-            )
-
-    def _media_state_has_column(self, column_name: str) -> bool:
-        """Description:
-        Check whether `media_state` contains a column.
-
-        Args:
-            column_name: Column name to check.
+        Read the SQLite schema version.
 
         Returns:
-            `True` when the column exists.
+            Current `PRAGMA user_version` value.
+
+        Side Effects:
+            Reads SQLite metadata.
+        """
+
+        row = self._connection.execute("PRAGMA user_version").fetchone()
+        return int(row[0])
+
+    def _table_names(self) -> set[str]:
+        """Description:
+        List application table names present in the database.
+
+        Returns:
+            Table names excluding SQLite internal tables.
 
         Side Effects:
             Reads SQLite schema metadata.
         """
 
-        columns = self._connection.execute("PRAGMA table_info(media_state)").fetchall()
-        return any(row["name"] == column_name for row in columns)
+        rows = self._connection.execute(
+            """
+            SELECT name
+            FROM sqlite_master
+            WHERE type = 'table'
+              AND name NOT LIKE 'sqlite_%'
+            """
+        ).fetchall()
+        return {str(row["name"]) for row in rows}
+
+    def _ensure_current_indexes(self) -> None:
+        """Description:
+        Ensure indexes for the current schema exist.
+
+        Side Effects:
+            Writes SQLite indexes when missing.
+        """
+
+        self._connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_media_state_uploaded_time
+                ON media_state (uploaded_time DESC, media_id)
+            """
+        )
+        self._connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_recent_page_checkpoints_oldest
+                ON recent_page_checkpoints (oldest_upload_time ASC, rpc_id)
+            """
+        )
+        self._connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_upload_coverage_ranges_bounds
+                ON upload_coverage_ranges (oldest_upload_time ASC, newest_upload_time DESC)
+            """
+        )
 
     def upsert_media(self, metadata: MediaMetadata) -> MediaStateRecord:
         """Description:
@@ -412,42 +485,152 @@ class PullStateStore:
 
     def upload_coverage_satisfies(self, after: datetime) -> bool:
         """Description:
-        Check whether the rolling index covers the requested lower bound.
+        Check whether any trusted range covers the requested lower bound.
 
         Args:
             after: Inclusive lower-bound timestamp requested by the caller.
 
         Returns:
-            `True` when the index is known complete from newest through `after`.
+            `True` when a trusted coverage range extends through `after`.
         """
 
-        checkpoint = self.get_checkpoint(UPLOAD_COVERAGE_CHECKPOINT)
-        if checkpoint is None or checkpoint.value is None:
-            return False
-        covered_after = datetime.fromisoformat(checkpoint.value)
-        return covered_after <= after.astimezone(UTC)
+        normalized_after = after.astimezone(UTC).isoformat()
+        row = self._connection.execute(
+            """
+            SELECT 1
+            FROM upload_coverage_ranges
+            WHERE oldest_upload_time <= ?
+            LIMIT 1
+            """,
+            (normalized_after,),
+        ).fetchone()
+        return row is not None
 
-    def advance_upload_coverage(self, oldest_upload_time: datetime) -> SyncCheckpoint:
+    def upload_window_satisfies(self, *, after: datetime, before: datetime | None) -> bool:
         """Description:
-        Advance the rolling upload coverage checkpoint.
+        Check whether a bounded upload window is fully covered by the local index.
 
         Args:
-            oldest_upload_time: Oldest upload timestamp durably indexed so far.
+            after: Inclusive lower-bound timestamp requested by the caller.
+            before: Optional exclusive upper-bound timestamp requested by the caller.
 
         Returns:
-            Persisted rolling coverage checkpoint.
-
-        Side Effects:
-            Writes a checkpoint row after successful page/index commits.
+            `True` when the index can answer `[after, before)` without a live
+            refresh. Open-ended windows are never considered fully covered.
         """
 
-        normalized_after = oldest_upload_time.astimezone(UTC)
-        checkpoint = self.get_checkpoint(UPLOAD_COVERAGE_CHECKPOINT)
-        if checkpoint is not None and checkpoint.value is not None:
-            existing_after = datetime.fromisoformat(checkpoint.value)
-            if existing_after <= normalized_after:
-                return checkpoint
-        return self.set_checkpoint(UPLOAD_COVERAGE_CHECKPOINT, normalized_after.isoformat())
+        if before is None:
+            return False
+        normalized_after = after.astimezone(UTC).isoformat()
+        normalized_before = before.astimezone(UTC).isoformat()
+        row = self._connection.execute(
+            """
+            SELECT 1
+            FROM upload_coverage_ranges
+            WHERE oldest_upload_time <= ?
+              AND newest_upload_time >= ?
+            LIMIT 1
+            """,
+            (normalized_after, normalized_before),
+        ).fetchone()
+        return row is not None
+
+    def upload_time_has_covering_range(self, *, uploaded_time: datetime, after: datetime) -> bool:
+        """Description:
+        Check whether an upload timestamp is inside a range that reaches `after`.
+
+        Args:
+            uploaded_time: Upload timestamp from a live Recent payload item.
+            after: Requested inclusive lower bound.
+
+        Returns:
+            `True` when the timestamp is inside a trusted range whose lower
+            bound already covers the requested `after` timestamp.
+        """
+
+        normalized_upload = uploaded_time.astimezone(UTC).isoformat()
+        normalized_after = after.astimezone(UTC).isoformat()
+        row = self._connection.execute(
+            """
+            SELECT 1
+            FROM upload_coverage_ranges
+            WHERE oldest_upload_time <= ?
+              AND oldest_upload_time <= ?
+              AND newest_upload_time >= ?
+            LIMIT 1
+            """,
+            (normalized_after, normalized_upload, normalized_upload),
+        ).fetchone()
+        return row is not None
+
+    def record_upload_coverage(
+        self,
+        *,
+        oldest_upload_time: datetime,
+        newest_upload_time: datetime,
+    ) -> None:
+        """Description:
+        Record a trusted contiguous upload-time coverage range.
+
+        Args:
+            oldest_upload_time: Inclusive lower bound of the contiguous traversal.
+            newest_upload_time: Inclusive upper bound of the contiguous traversal.
+
+        Side Effects:
+            Inserts or merges rows in `upload_coverage_ranges`.
+        """
+
+        normalized_oldest = oldest_upload_time.astimezone(UTC)
+        normalized_newest = newest_upload_time.astimezone(UTC)
+        if normalized_oldest > normalized_newest:
+            raise ValueError("oldest_upload_time must be on or before newest_upload_time.")
+
+        with self._connection:
+            rows = self._connection.execute(
+                """
+                SELECT
+                    oldest_upload_time,
+                    newest_upload_time
+                FROM upload_coverage_ranges
+                WHERE oldest_upload_time <= ?
+                  AND newest_upload_time >= ?
+                """,
+                (normalized_newest.isoformat(), normalized_oldest.isoformat()),
+            ).fetchall()
+
+            merged_oldest = normalized_oldest
+            merged_newest = normalized_newest
+            for row in rows:
+                row_oldest = datetime.fromisoformat(str(row["oldest_upload_time"]))
+                row_newest = datetime.fromisoformat(str(row["newest_upload_time"]))
+                if row_oldest < merged_oldest:
+                    merged_oldest = row_oldest
+                if row_newest > merged_newest:
+                    merged_newest = row_newest
+
+            if rows:
+                self._connection.execute(
+                    """
+                    DELETE FROM upload_coverage_ranges
+                    WHERE oldest_upload_time <= ?
+                      AND newest_upload_time >= ?
+                    """,
+                    (normalized_newest.isoformat(), normalized_oldest.isoformat()),
+                )
+
+            self._connection.execute(
+                """
+                INSERT INTO upload_coverage_ranges (
+                    oldest_upload_time,
+                    newest_upload_time
+                )
+                VALUES (?, ?)
+                """,
+                (
+                    merged_oldest.isoformat(),
+                    merged_newest.isoformat(),
+                ),
+            )
 
     def upsert_recent_page_checkpoint(
         self,

@@ -30,6 +30,7 @@ from gphoto_pull.config import (
     ProjectConfig,
 )
 from gphoto_pull.interrupts import cooperative_sigint_handling, raise_if_interrupt_requested
+from gphoto_pull.state import StateSchemaError
 
 DEFAULT_CONFIG_VALUES = {
     "download_concurrency": "3",
@@ -915,6 +916,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     except BrowserSessionError as exc:
         print(f"Browser session error: {exc}", file=sys.stderr)
         return 3
+    except StateSchemaError as exc:
+        print(f"Media index reset required: {exc}", file=sys.stderr)
+        return 4
     except sqlite3.Error as exc:
         print(
             "Media index error: "

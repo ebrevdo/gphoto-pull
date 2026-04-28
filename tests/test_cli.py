@@ -21,6 +21,7 @@ from gphoto_pull.cli import (
     parse_args,
 )
 from gphoto_pull.config import ConfigOverrides, ProjectConfig
+from gphoto_pull.state import StateSchemaError
 
 MISSING_CONFIG_PATH = Path.cwd() / ".missing-gphoto-pull.toml"
 
@@ -151,6 +152,24 @@ class CliTests(unittest.TestCase):
 
         self.assertEqual(exit_code, 3)
         self.assertIn("Browser session error: missing chromium", rendered)
+
+    def test_main_reports_state_schema_reset_command(self) -> None:
+        config = ProjectConfig.from_sources(config_path=MISSING_CONFIG_PATH)
+        service = MagicMock()
+        service.pull.side_effect = StateSchemaError("old index; run reset --target index --yes")
+
+        with (
+            patch("gphoto_pull.cli._load_config", return_value=config),
+            patch("gphoto_pull.cli.GooglePhotosPuller", return_value=service),
+            io.StringIO() as stderr,
+            redirect_stderr(stderr),
+        ):
+            exit_code = main(["pull"])
+            rendered = stderr.getvalue()
+
+        self.assertEqual(exit_code, 4)
+        self.assertIn("Media index reset required:", rendered)
+        self.assertIn("reset --target index --yes", rendered)
 
     def test_main_returns_interrupted_exit_code(self) -> None:
         config = ProjectConfig.from_sources(config_path=MISSING_CONFIG_PATH)
