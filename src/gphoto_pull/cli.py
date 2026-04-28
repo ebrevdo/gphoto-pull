@@ -20,6 +20,7 @@ from typing import Annotated, override
 
 import tyro
 
+from gphoto_pull import __version__
 from gphoto_pull.automation import GooglePhotosPuller
 from gphoto_pull.browser import BrowserSessionError
 from gphoto_pull.config import (
@@ -895,6 +896,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     try:
         raw_args = sys.argv[1:] if argv is None else list(argv)
+        if raw_args == ["--version"]:
+            print(f"gphoto-pull {__version__}")
+            return 0
         if not raw_args:
             try:
                 parse_args(["--help"])

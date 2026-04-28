@@ -7,7 +7,7 @@ versioned section. The first release tag is `v0.0.1`.
 
 ## Unreleased
 
-- Nothing yet.
+- Added `gphoto-pull --version`.
 
 ## v0.0.3
 
