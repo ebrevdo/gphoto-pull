@@ -246,10 +246,14 @@ def _noop_response_handler(response: object) -> None:
 
 
 class DownloadTraceTests(unittest.TestCase):
-    def test_pull_live_checks_auth_before_using_covered_index(self) -> None:
+    def test_pull_live_checks_auth_before_refreshing_covered_index(self) -> None:
+        class FakePage:
+            async def close(self) -> None:
+                events.append("close-page")
+
         class FakeContextManager:
-            async def __aenter__(self) -> SimpleNamespace:
-                return SimpleNamespace()
+            async def __aenter__(self) -> "FakeContextManager":
+                return self
 
             async def __aexit__(
                 self,
@@ -258,6 +262,10 @@ class DownloadTraceTests(unittest.TestCase):
                 _tb: object,
             ) -> bool:
                 return False
+
+            async def new_page(self) -> FakePage:
+                events.append("new-page")
+                return FakePage()
 
         class FakeStore:
             def __enter__(self) -> "FakeStore":
@@ -287,6 +295,16 @@ class DownloadTraceTests(unittest.TestCase):
         async def fake_auth_check(*_args: object, **_kwargs: object) -> AccountScope:
             events.append("auth")
             return AccountScope("account-key")
+
+        async def fake_recent_probe(*_args: object, **kwargs: object) -> int:
+            events.append("recent")
+            self.assertIs(kwargs.get("stop_on_index_overlap"), True)
+            self.assertIs(kwargs.get("allow_checkpoint_resume"), False)
+            return 1
+
+        async def fake_updates_probe(*_args: object, **_kwargs: object) -> int:
+            events.append("updates")
+            return 1
 
         async def fake_download_summary(*_args: object, **_kwargs: object) -> PullExecutionSummary:
             events.append("download")
@@ -320,12 +338,27 @@ class DownloadTraceTests(unittest.TestCase):
                 "gphoto_pull.automation._assert_authenticated_photos_session_async",
                 fake_auth_check,
             ),
+            patch("gphoto_pull.automation._capture_recent_probe_async", fake_recent_probe),
+            patch("gphoto_pull.automation._capture_updates_probe_async", fake_updates_probe),
             patch("gphoto_pull.automation.PullStateStore", return_value=FakeStore()),
             patch.object(service, "_download_summary_candidates", fake_download_summary),
         ):
             asyncio.run(service._pull_live(paths, []))
 
-        self.assertEqual(events, ["auth", "store", "download"])
+        self.assertEqual(
+            events,
+            [
+                "auth",
+                "store",
+                "new-page",
+                "recent",
+                "close-page",
+                "new-page",
+                "updates",
+                "close-page",
+                "download",
+            ],
+        )
 
     def test_account_scoped_sync_db_path_uses_template_parent_and_name(self) -> None:
         template = Path("/tmp/gphoto/state/pull-state.sqlite3")
@@ -479,6 +512,112 @@ class DownloadTraceTests(unittest.TestCase):
                 "first-page-cursor",
             ],
         )
+
+    def test_recent_pagination_stops_at_trusted_index_overlap(self) -> None:
+        initial = _recent_raw("AF1QipNew", 1770000300000, "first-page-cursor")
+        overlap = _recent_raw("AF1QipKnown", 1770000200000, "known-cursor")
+        older = _recent_raw("AF1QipOlder", 1262304000000, "done-cursor")
+        request_context = _FakeApiRequestContext([overlap, older])
+
+        async def run() -> bool:
+            with (
+                TemporaryDirectory() as tmp_dir,
+                PullStateStore(Path(tmp_dir) / "index.sqlite3") as store,
+            ):
+                store.upsert_media(
+                    MediaMetadata(
+                        media_id="AF1QipKnown",
+                        filename="known.jpg",
+                        uploaded_time=datetime.fromtimestamp(1770000200000 / 1000, tz=UTC),
+                    )
+                )
+                store.upsert_recent_page_checkpoint(
+                    rpc_id="opaqueRecentRpc",
+                    cursor="checkpoint-cursor",
+                    oldest_upload_time=datetime(2026, 1, 1, tzinfo=UTC),
+                    item_count=500,
+                    page_count=10,
+                )
+                capture = _AsyncResponseCapture(
+                    response_texts=[initial],
+                    tasks=set(),
+                    accepted_event=asyncio.Event(),
+                    page=cast("Page", SimpleNamespace()),
+                    response_handler=cast("Callable[[Response], None]", _noop_response_handler),
+                )
+                return await _page_recent_payloads_to_window(
+                    cast("APIRequestContext", request_context),
+                    capture,
+                    [
+                        _RecentPageRequest(
+                            rpc_id="opaqueRecentRpc",
+                            url="https://photos.google.com/_/PhotosUi/data/batchexecute",
+                            at_token="token",
+                        )
+                    ],
+                    after=datetime(2026, 1, 1, tzinfo=UTC),
+                    state_store=store,
+                    stop_on_index_overlap=True,
+                    allow_checkpoint_resume=False,
+                )
+
+        completed = asyncio.run(run())
+
+        self.assertTrue(completed)
+        self.assertEqual(request_context.requested_cursors, ["first-page-cursor"])
+
+    def test_recent_pagination_ignores_overlap_when_index_coverage_is_not_trusted(self) -> None:
+        initial = _recent_raw("AF1QipNew", 1770000300000, "first-page-cursor")
+        overlap = _recent_raw("AF1QipKnown", 1770000200000, "known-cursor")
+        older = _recent_raw("AF1QipOlder", 1262304000000, "done-cursor")
+        request_context = _FakeApiRequestContext([overlap, older])
+
+        async def run() -> bool:
+            with (
+                TemporaryDirectory() as tmp_dir,
+                PullStateStore(Path(tmp_dir) / "index.sqlite3") as store,
+            ):
+                store.upsert_media(
+                    MediaMetadata(
+                        media_id="AF1QipKnown",
+                        filename="known.jpg",
+                        uploaded_time=datetime.fromtimestamp(1770000200000 / 1000, tz=UTC),
+                    )
+                )
+                store.upsert_recent_page_checkpoint(
+                    rpc_id="opaqueRecentRpc",
+                    cursor="checkpoint-cursor",
+                    oldest_upload_time=datetime(2026, 1, 1, tzinfo=UTC),
+                    item_count=500,
+                    page_count=10,
+                )
+                capture = _AsyncResponseCapture(
+                    response_texts=[initial],
+                    tasks=set(),
+                    accepted_event=asyncio.Event(),
+                    page=cast("Page", SimpleNamespace()),
+                    response_handler=cast("Callable[[Response], None]", _noop_response_handler),
+                )
+                return await _page_recent_payloads_to_window(
+                    cast("APIRequestContext", request_context),
+                    capture,
+                    [
+                        _RecentPageRequest(
+                            rpc_id="opaqueRecentRpc",
+                            url="https://photos.google.com/_/PhotosUi/data/batchexecute",
+                            at_token="token",
+                        )
+                    ],
+                    after=datetime(2026, 1, 1, tzinfo=UTC),
+                    state_store=store,
+                    stop_on_index_overlap=False,
+                    allow_checkpoint_resume=False,
+                )
+
+        completed = asyncio.run(run())
+
+        self.assertTrue(completed)
+        self.assertEqual(request_context.requested_cursors, ["first-page-cursor", "known-cursor"])
 
     def test_persist_recent_payloads_from_captured_responses_updates_index(self) -> None:
         raw_text = _recent_raw("AF1QipCaptured", 1770000100000, "next-cursor")

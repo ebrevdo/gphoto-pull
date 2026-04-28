@@ -742,67 +742,51 @@ class GooglePhotosPuller:
             if self.config.after is None:
                 raise ConfigError("`after` is required before running a pull.")
             with PullStateStore(state_db_path) as state_store:
-                if state_store.upload_coverage_satisfies(self.config.after):
-                    LOGGER.log(PHASE_LOG_LEVEL, "Using covered media index.")
-                    records = state_store.list_media_in_upload_window(
-                        after=self.config.after,
-                        before=self.config.before,
-                    )
-                    summary = enumerate_index_candidates(
-                        records,
-                        after=self.config.after,
-                        before=self.config.before,
-                    )
-                    lines.extend(
-                        _enumeration_summary_lines(
-                            summary,
-                            state_db_path,
-                            label_prefix="Indexed",
-                        )
-                    )
-                else:
-                    LOGGER.log(PHASE_LOG_LEVEL, "Capturing Recently added diagnostics.")
-                    recent_page = await context.new_page()
-                    recent_response_count = await _capture_recent_probe_async(
-                        recent_page,
-                        diagnostics_dir=self.config.diagnostics_dir,
-                        photos_ui=self.photos_ui,
-                        after=self.config.after,
-                        state_store=state_store,
-                    )
-                    await recent_page.close()
+                stop_on_index_overlap = state_store.upload_coverage_satisfies(self.config.after)
+                LOGGER.log(PHASE_LOG_LEVEL, "Capturing Recently added diagnostics.")
+                recent_page = await context.new_page()
+                recent_response_count = await _capture_recent_probe_async(
+                    recent_page,
+                    diagnostics_dir=self.config.diagnostics_dir,
+                    photos_ui=self.photos_ui,
+                    after=self.config.after,
+                    state_store=state_store,
+                    stop_on_index_overlap=stop_on_index_overlap,
+                    allow_checkpoint_resume=False,
+                )
+                await recent_page.close()
 
-                    LOGGER.log(PHASE_LOG_LEVEL, "Capturing Updates diagnostics.")
-                    updates_page = await context.new_page()
-                    updates_response_count = await _capture_updates_probe_async(
-                        updates_page,
-                        diagnostics_dir=self.config.diagnostics_dir,
-                    )
-                    await updates_page.close()
+                LOGGER.log(PHASE_LOG_LEVEL, "Capturing Updates diagnostics.")
+                updates_page = await context.new_page()
+                updates_response_count = await _capture_updates_probe_async(
+                    updates_page,
+                    diagnostics_dir=self.config.diagnostics_dir,
+                )
+                await updates_page.close()
 
-                    lines.append(
-                        "Captured live diagnostics: "
-                        f"recent batchexecute responses={recent_response_count}, "
-                        f"updates batchexecute responses={updates_response_count}"
-                    )
+                lines.append(
+                    "Captured live diagnostics: "
+                    f"recent batchexecute responses={recent_response_count}, "
+                    f"updates batchexecute responses={updates_response_count}"
+                )
 
-                    LOGGER.log(PHASE_LOG_LEVEL, "Querying refreshed media index.")
-                    records = state_store.list_media_in_upload_window(
-                        after=self.config.after,
-                        before=self.config.before,
+                LOGGER.log(PHASE_LOG_LEVEL, "Querying refreshed media index.")
+                records = state_store.list_media_in_upload_window(
+                    after=self.config.after,
+                    before=self.config.before,
+                )
+                summary = enumerate_index_candidates(
+                    records,
+                    after=self.config.after,
+                    before=self.config.before,
+                )
+                lines.extend(
+                    _enumeration_summary_lines(
+                        summary,
+                        state_db_path,
+                        label_prefix="Indexed",
                     )
-                    summary = enumerate_index_candidates(
-                        records,
-                        after=self.config.after,
-                        before=self.config.before,
-                    )
-                    lines.extend(
-                        _enumeration_summary_lines(
-                            summary,
-                            state_db_path,
-                            label_prefix="Indexed",
-                        )
-                    )
+                )
 
                 return await self._download_summary_candidates(context, state_store, summary, lines)
 
@@ -1080,6 +1064,8 @@ async def _capture_recent_probe_async(
     photos_ui: GooglePhotosUi,
     after: datetime,
     state_store: PullStateStore | None = None,
+    stop_on_index_overlap: bool = False,
+    allow_checkpoint_resume: bool = True,
 ) -> int:
     """Description:
     Visit Recently Added and capture live batchexecute diagnostics.
@@ -1090,6 +1076,10 @@ async def _capture_recent_probe_async(
         photos_ui: Google Photos UI adapter.
         after: Inclusive lower-bound timestamp for deciding scroll depth.
         state_store: Optional media index used for cursor checkpoint resume.
+        stop_on_index_overlap: Whether indexed media overlap can stop the live
+            refresh before reaching `after`.
+        allow_checkpoint_resume: Whether stored older-page cursors can be used
+            to resume deep pagination.
 
     Returns:
         Number of captured recent batchexecute responses.
@@ -1159,12 +1149,30 @@ async def _capture_recent_probe_async(
                 )
                 break
 
+            if stop_on_index_overlap and _recent_payloads_overlap_index(
+                capture.response_texts,
+                state_store,
+            ):
+                LOGGER.log(
+                    PHASE_LOG_LEVEL,
+                    "Recent probe reached indexed overlap: items=%s oldest_upload=%s",
+                    previous_payload_count,
+                    (
+                        oldest_upload_time.isoformat()
+                        if oldest_upload_time is not None
+                        else "<unknown>"
+                    ),
+                )
+                break
+
             if await _page_recent_payloads_to_window(
                 page.context.request,
                 capture,
                 recent_page_requests,
                 after=after,
                 state_store=state_store,
+                stop_on_index_overlap=stop_on_index_overlap,
+                allow_checkpoint_resume=allow_checkpoint_resume,
             ):
                 break
 
@@ -1617,6 +1625,8 @@ async def _page_recent_payloads_to_window(
     *,
     after: datetime,
     state_store: PullStateStore | None,
+    stop_on_index_overlap: bool = False,
+    allow_checkpoint_resume: bool = True,
 ) -> bool:
     """Description:
     Fetch older Recently Added pages directly until the requested window is reached.
@@ -1627,6 +1637,10 @@ async def _page_recent_payloads_to_window(
         recent_page_requests: Browser-originated recent request templates.
         after: Inclusive lower-bound timestamp.
         state_store: Optional media index used for cursor checkpoint resume.
+        stop_on_index_overlap: Whether a page containing a media id already in
+            the index can complete pagination.
+        allow_checkpoint_resume: Whether stored older-page cursors can be used
+            to resume deep pagination.
 
     Returns:
         `True` when direct pagination reached the requested lower bound or feed end.
@@ -1649,7 +1663,7 @@ async def _page_recent_payloads_to_window(
     current_rpc_ids = tuple(dict.fromkeys(request.rpc_id for request in recent_page_requests))
     checkpoint = (
         state_store.best_recent_page_checkpoint(after=after, rpc_ids=current_rpc_ids)
-        if state_store is not None
+        if state_store is not None and allow_checkpoint_resume and not stop_on_index_overlap
         else None
     )
     if checkpoint is not None:
@@ -1672,6 +1686,7 @@ async def _page_recent_payloads_to_window(
                 start=checkpoint_start,
                 after=after,
                 state_store=state_store,
+                stop_on_index_overlap=stop_on_index_overlap,
             )
         except KeyboardInterrupt:
             raise
@@ -1699,6 +1714,7 @@ async def _page_recent_payloads_to_window(
             start=_RecentPaginationStart(cursor=normal_cursor, page_count=0),
             after=after,
             state_store=state_store,
+            stop_on_index_overlap=stop_on_index_overlap,
         )
     ).completed
 
@@ -1711,6 +1727,7 @@ async def _page_recent_payloads_from_start(
     start: _RecentPaginationStart,
     after: datetime,
     state_store: PullStateStore | None,
+    stop_on_index_overlap: bool,
 ) -> _RecentPaginationResult:
     """Description:
     Fetch direct recent pages from one starting cursor.
@@ -1722,6 +1739,8 @@ async def _page_recent_payloads_from_start(
         start: Cursor and page count to start from.
         after: Inclusive lower-bound timestamp.
         state_store: Optional media index used for cursor checkpoints.
+        stop_on_index_overlap: Whether indexed media overlap can complete
+            pagination before reaching `after`.
 
     Returns:
         Pagination result distinguishing normal completion from bad checkpoints.
@@ -1778,6 +1797,10 @@ async def _page_recent_payloads_from_start(
             request_template=request_template,
             cursor=cursor.cursor,
         )
+        overlaps_index = stop_on_index_overlap and _recent_payload_overlaps_index(
+            raw_text,
+            state_store,
+        )
         capture.response_texts.append(raw_text)
         page_count += 1
 
@@ -1805,6 +1828,14 @@ async def _page_recent_payloads_from_start(
             cursor=cursor,
             page_count=page_count,
         )
+        if overlaps_index:
+            LOGGER.log(
+                PHASE_LOG_LEVEL,
+                "Recent direct pagination stopped after indexed overlap: pages=%s items=%s",
+                page_count,
+                stats.item_count,
+            )
+            return _RecentPaginationResult(completed=True)
         if stats.oldest_upload_time is not None and stats.oldest_upload_time < after:
             return _RecentPaginationResult(completed=True)
         if no_progress_pages >= 5:
@@ -1945,6 +1976,54 @@ def _persist_recent_payload_page(state_store: PullStateStore, payload: RecentPay
                 height=item.height,
             )
         )
+
+
+def _recent_payloads_overlap_index(
+    response_texts: list[str],
+    state_store: PullStateStore | None,
+) -> bool:
+    """Description:
+    Check whether captured recent-media payloads overlap existing index rows.
+
+    Args:
+        response_texts: Raw batchexecute response bodies.
+        state_store: Optional media index to check.
+
+    Returns:
+        `True` when any captured media id already existed in the index with a
+        known upload timestamp.
+    """
+
+    return any(_recent_payload_overlaps_index(raw_text, state_store) for raw_text in response_texts)
+
+
+def _recent_payload_overlaps_index(
+    raw_text: str,
+    state_store: PullStateStore | None,
+) -> bool:
+    """Description:
+    Check whether one recent-media payload overlaps existing index rows.
+
+    Args:
+        raw_text: Raw batchexecute response body.
+        state_store: Optional media index to check.
+
+    Returns:
+        `True` when the payload contains a media id already indexed with a known
+        upload timestamp.
+    """
+
+    if state_store is None:
+        return False
+    try:
+        payload = parse_recent_payload(raw_text)
+    except RpcPayloadParseError:
+        return False
+    for item in payload.items:
+        record = state_store.get_media(item.media_id)
+        if record is not None and record.metadata.uploaded_time is not None:
+            return True
+    return False
 
 
 def _recent_payload_stats(response_texts: list[str]) -> _RecentPayloadStats:
