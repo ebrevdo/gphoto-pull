@@ -7,6 +7,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import MagicMock, patch
 
+from gphoto_pull import __version__
 from gphoto_pull.automation import GooglePhotosPuller
 from gphoto_pull.browser import BrowserSessionError, BrowserSessionPaths
 from gphoto_pull.cli import (
@@ -27,6 +28,19 @@ MISSING_CONFIG_PATH = Path.cwd() / ".missing-gphoto-pull.toml"
 
 
 class CliTests(unittest.TestCase):
+    def test_main_prints_version(self) -> None:
+        with (
+            patch("gphoto_pull.cli._load_config") as load_config,
+            io.StringIO() as stdout,
+            redirect_stdout(stdout),
+        ):
+            exit_code = main(["--version"])
+            rendered = stdout.getvalue()
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(rendered, f"gphoto-pull {__version__}\n")
+        load_config.assert_not_called()
+
     def test_main_without_args_prints_help(self) -> None:
         with io.StringIO() as stdout, redirect_stdout(stdout):
             exit_code = main([])
