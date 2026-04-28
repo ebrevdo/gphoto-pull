@@ -6,7 +6,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from gphoto_pull.models import MediaMetadata
-from gphoto_pull.state import PullStateStore
+from gphoto_pull.state import PullStateStore, StateSchemaError
 
 
 class PullStateStoreTests(unittest.TestCase):
@@ -30,7 +30,12 @@ class PullStateStoreTests(unittest.TestCase):
 
             self.assertEqual(
                 [row[0] for row in rows],
-                ["media_state", "recent_page_checkpoints", "sync_checkpoints"],
+                [
+                    "media_state",
+                    "recent_page_checkpoints",
+                    "sync_checkpoints",
+                    "upload_coverage_ranges",
+                ],
             )
 
     def test_upsert_get_and_list_media_records(self) -> None:
@@ -139,6 +144,13 @@ class PullStateStoreTests(unittest.TestCase):
             )
             store.upsert_media(
                 MediaMetadata(
+                    media_id="newer-covered",
+                    filename="IMG_0003.JPG",
+                    uploaded_time=datetime(2026, 4, 20, 12, 0, tzinfo=UTC),
+                )
+            )
+            store.upsert_media(
+                MediaMetadata(
                     media_id="too-old",
                     filename="IMG_0002.JPG",
                     uploaded_time=datetime(2026, 4, 17, 12, 0, tzinfo=UTC),
@@ -148,11 +160,88 @@ class PullStateStoreTests(unittest.TestCase):
             before = datetime(2026, 4, 19, 0, 0, tzinfo=UTC)
 
             self.assertFalse(store.upload_coverage_satisfies(after))
-            store.advance_upload_coverage(after)
+            store.record_upload_coverage(
+                oldest_upload_time=after,
+                newest_upload_time=datetime(2026, 4, 20, 12, 0, tzinfo=UTC),
+            )
             records = store.list_media_in_upload_window(after=after, before=before)
 
             self.assertTrue(store.upload_coverage_satisfies(after))
+            self.assertTrue(store.upload_window_satisfies(after=after, before=before))
+            self.assertFalse(
+                store.upload_window_satisfies(
+                    after=after,
+                    before=datetime(2026, 4, 21, 0, 0, tzinfo=UTC),
+                )
+            )
+            self.assertFalse(store.upload_window_satisfies(after=after, before=None))
             self.assertEqual([record.metadata.media_id for record in records], ["in-window"])
+
+    def test_upload_window_requires_one_contiguous_coverage_range(self) -> None:
+        with (
+            TemporaryDirectory() as tmp_dir,
+            PullStateStore(Path(tmp_dir) / "pull-state.sqlite3") as store,
+        ):
+            store.record_upload_coverage(
+                oldest_upload_time=datetime(2026, 1, 1, tzinfo=UTC),
+                newest_upload_time=datetime(2026, 3, 1, tzinfo=UTC),
+            )
+            store.record_upload_coverage(
+                oldest_upload_time=datetime(2026, 4, 20, tzinfo=UTC),
+                newest_upload_time=datetime(2026, 4, 27, tzinfo=UTC),
+            )
+
+            self.assertFalse(
+                store.upload_window_satisfies(
+                    after=datetime(2026, 3, 10, tzinfo=UTC),
+                    before=datetime(2026, 3, 15, tzinfo=UTC),
+                )
+            )
+            self.assertTrue(
+                store.upload_window_satisfies(
+                    after=datetime(2026, 4, 21, tzinfo=UTC),
+                    before=datetime(2026, 4, 22, tzinfo=UTC),
+                )
+            )
+            self.assertFalse(
+                store.upload_time_has_covering_range(
+                    uploaded_time=datetime(2026, 4, 21, tzinfo=UTC),
+                    after=datetime(2026, 3, 10, tzinfo=UTC),
+                )
+            )
+
+    def test_upload_coverage_merges_only_overlapping_ranges(self) -> None:
+        with (
+            TemporaryDirectory() as tmp_dir,
+            PullStateStore(Path(tmp_dir) / "pull-state.sqlite3") as store,
+        ):
+            store.record_upload_coverage(
+                oldest_upload_time=datetime(2026, 1, 1, tzinfo=UTC),
+                newest_upload_time=datetime(2026, 3, 1, tzinfo=UTC),
+            )
+            store.record_upload_coverage(
+                oldest_upload_time=datetime(2026, 4, 20, tzinfo=UTC),
+                newest_upload_time=datetime(2026, 4, 27, tzinfo=UTC),
+            )
+
+            self.assertFalse(
+                store.upload_window_satisfies(
+                    after=datetime(2026, 3, 10, tzinfo=UTC),
+                    before=datetime(2026, 3, 15, tzinfo=UTC),
+                )
+            )
+
+            store.record_upload_coverage(
+                oldest_upload_time=datetime(2026, 2, 25, tzinfo=UTC),
+                newest_upload_time=datetime(2026, 4, 21, tzinfo=UTC),
+            )
+
+            self.assertTrue(
+                store.upload_window_satisfies(
+                    after=datetime(2026, 3, 10, tzinfo=UTC),
+                    before=datetime(2026, 4, 26, tzinfo=UTC),
+                )
+            )
 
     def test_recent_page_checkpoint_selects_nearest_resume_cursor(self) -> None:
         with (
@@ -188,7 +277,7 @@ class PullStateStoreTests(unittest.TestCase):
             self.assertEqual(checkpoint.cursor, "cursor-feb")
             self.assertIsNone(no_matching_rpc)
 
-    def test_initialize_adds_index_columns_to_existing_index_database(self) -> None:
+    def test_initialize_rejects_existing_older_index_database(self) -> None:
         with TemporaryDirectory() as tmp_dir:
             db_path = Path(tmp_dir) / "pull-state.sqlite3"
 
@@ -244,28 +333,8 @@ class PullStateStoreTests(unittest.TestCase):
                 )
                 connection.commit()
 
-            with PullStateStore(db_path) as store:
-                loaded = store.get_media("media-existing")
-                inserted = store.upsert_media(
-                    MediaMetadata(
-                        media_id="media-new",
-                        filename="IMG_new.JPG",
-                        uploaded_time=datetime(2026, 4, 18, 12, 0, tzinfo=UTC),
-                    )
-                )
-
-            self.assertIsNotNone(loaded)
-            assert loaded is not None
-            self.assertIsNone(loaded.metadata.uploaded_time)
-            self.assertIsNone(loaded.metadata.preview_url)
-            self.assertEqual(inserted.metadata.media_id, "media-new")
-
-            with closing(sqlite3.connect(db_path)) as connection:
-                columns = connection.execute("PRAGMA table_info(media_state)").fetchall()
-
-            column_names = [column[1] for column in columns]
-            self.assertIn("uploaded_time", column_names)
-            self.assertIn("preview_url", column_names)
+            with self.assertRaisesRegex(StateSchemaError, "reset --target index --yes"):
+                PullStateStore(db_path)
 
 
 if __name__ == "__main__":

@@ -283,6 +283,15 @@ class DownloadTraceTests(unittest.TestCase):
             def upload_coverage_satisfies(self, _after: datetime) -> bool:
                 return True
 
+            def upload_window_satisfies(
+                self,
+                *,
+                after: datetime,
+                before: datetime | None,
+            ) -> bool:
+                _ = after, before
+                return False
+
             def list_media_in_upload_window(
                 self,
                 *,
@@ -360,6 +369,130 @@ class DownloadTraceTests(unittest.TestCase):
             ],
         )
 
+    def test_pull_live_skips_refresh_for_covered_bounded_index_window(self) -> None:
+        test_case = self
+
+        class FakeContextManager:
+            async def __aenter__(self) -> "FakeContextManager":
+                return self
+
+            async def __aexit__(
+                self,
+                _exc_type: object,
+                _exc: object,
+                _tb: object,
+            ) -> bool:
+                return False
+
+            async def new_page(self) -> object:
+                raise AssertionError("covered bounded windows should not refresh live pages")
+
+        class FakeStore:
+            def __enter__(self) -> "FakeStore":
+                events.append("store")
+                return self
+
+            def __exit__(
+                self,
+                _exc_type: object,
+                _exc: object,
+                _tb: object,
+            ) -> bool:
+                return False
+
+            def upload_window_satisfies(
+                self,
+                *,
+                after: datetime,
+                before: datetime | None,
+            ) -> bool:
+                events.append("coverage")
+                test_case.assertEqual(
+                    after,
+                    datetime.fromisoformat("2026-01-02T03:04:05-08:00"),
+                )
+                test_case.assertEqual(
+                    before,
+                    datetime.fromisoformat("2026-01-03T03:04:05-08:00"),
+                )
+                return True
+
+            def upload_coverage_satisfies(self, _after: datetime) -> bool:
+                raise AssertionError("covered bounded windows should not probe overlap")
+
+            def list_media_in_upload_window(
+                self,
+                *,
+                after: datetime,
+                before: datetime | None,
+            ) -> list[MediaStateRecord]:
+                events.append("list")
+                test_case.assertEqual(
+                    after,
+                    datetime.fromisoformat("2026-01-02T03:04:05-08:00"),
+                )
+                test_case.assertEqual(
+                    before,
+                    datetime.fromisoformat("2026-01-03T03:04:05-08:00"),
+                )
+                return []
+
+        async def fake_auth_check(*_args: object, **_kwargs: object) -> AccountScope:
+            events.append("auth")
+            return AccountScope("account-key")
+
+        async def fail_recent_probe(*_args: object, **_kwargs: object) -> int:
+            raise AssertionError("covered bounded windows should not capture Recently added")
+
+        async def fail_updates_probe(*_args: object, **_kwargs: object) -> int:
+            raise AssertionError("covered bounded windows should not capture Updates")
+
+        async def fake_download_summary(*_args: object, **_kwargs: object) -> PullExecutionSummary:
+            events.append("download")
+            return PullExecutionSummary(
+                queued_count=0,
+                skipped_existing_count=0,
+                downloaded_count=0,
+                failed_count=0,
+                failure_media_ids=(),
+            )
+
+        events: list[str] = []
+        config = ProjectConfig.from_sources(
+            config_path=Path("/missing-gphoto-pull.toml"),
+            overrides=ConfigOverrides(
+                after="2026-01-02T03:04:05-08:00",
+                before="2026-01-03T03:04:05-08:00",
+            ),
+        )
+        service = GooglePhotosPuller(config)
+        paths = BrowserSessionPaths(
+            download_dir=config.download_dir,
+            profile_dir=config.browser_profile_dir,
+            diagnostics_dir=config.diagnostics_dir,
+            browsers_path=config.browsers_path,
+        )
+        lines: list[str] = []
+
+        with (
+            patch(
+                "gphoto_pull.automation.launched_browser_context_async",
+                return_value=FakeContextManager(),
+            ),
+            patch(
+                "gphoto_pull.automation._assert_authenticated_photos_session_async",
+                fake_auth_check,
+            ),
+            patch("gphoto_pull.automation._capture_recent_probe_async", fail_recent_probe),
+            patch("gphoto_pull.automation._capture_updates_probe_async", fail_updates_probe),
+            patch("gphoto_pull.automation.PullStateStore", return_value=FakeStore()),
+            patch.object(service, "_download_summary_candidates", fake_download_summary),
+        ):
+            asyncio.run(service._pull_live(paths, lines))
+
+        self.assertEqual(events, ["auth", "store", "coverage", "list", "download"])
+        self.assertIn("Indexed window coverage: complete; skipping live diagnostics", lines)
+
     def test_account_scoped_sync_db_path_uses_template_parent_and_name(self) -> None:
         template = Path("/tmp/gphoto/state/pull-state.sqlite3")
 
@@ -422,7 +555,6 @@ class DownloadTraceTests(unittest.TestCase):
                 rpc_ids=("opaqueRecentRpc",),
             )
             indexed = store.get_media("AF1QipCheckpoint")
-            covered = store.upload_coverage_satisfies(datetime(2026, 2, 3, tzinfo=UTC))
 
         self.assertIsNotNone(checkpoint)
         assert checkpoint is not None
@@ -438,7 +570,6 @@ class DownloadTraceTests(unittest.TestCase):
             indexed.metadata.product_url,
             "https://photos.google.com/photo/AF1QipCheckpoint",
         )
-        self.assertTrue(covered)
 
     def test_recent_payload_stats_incrementally_dedupes_media(self) -> None:
         first = (
@@ -513,6 +644,83 @@ class DownloadTraceTests(unittest.TestCase):
             ],
         )
 
+    def test_recent_pagination_records_checkpoint_resume_as_disjoint_coverage(self) -> None:
+        initial = _recent_raw(
+            "AF1QipInitial",
+            int(datetime(2026, 4, 27, tzinfo=UTC).timestamp() * 1000),
+            "first-page-cursor",
+        )
+        checkpoint_page = _recent_raw(
+            "AF1QipCheckpointOlder",
+            int(datetime(2025, 12, 31, tzinfo=UTC).timestamp() * 1000),
+            "done-cursor",
+        )
+        request_context = _FakeApiRequestContext([checkpoint_page])
+
+        async def run() -> tuple[bool, bool, bool]:
+            with (
+                TemporaryDirectory() as tmp_dir,
+                PullStateStore(Path(tmp_dir) / "index.sqlite3") as store,
+            ):
+                store.upsert_recent_page_checkpoint(
+                    rpc_id="opaqueRecentRpc",
+                    cursor="checkpoint-cursor",
+                    oldest_upload_time=datetime(2026, 1, 15, tzinfo=UTC),
+                    item_count=500,
+                    page_count=10,
+                )
+                capture = _AsyncResponseCapture(
+                    response_texts=[initial],
+                    tasks=set(),
+                    accepted_event=asyncio.Event(),
+                    page=cast("Page", SimpleNamespace()),
+                    response_handler=cast("Callable[[Response], None]", _noop_response_handler),
+                )
+
+                completed = await _page_recent_payloads_to_window(
+                    cast("APIRequestContext", request_context),
+                    capture,
+                    [
+                        _RecentPageRequest(
+                            rpc_id="opaqueRecentRpc",
+                            url="https://photos.google.com/_/PhotosUi/data/batchexecute",
+                            at_token="token",
+                        )
+                    ],
+                    after=datetime(2026, 1, 1, tzinfo=UTC),
+                    state_store=store,
+                    allow_checkpoint_resume=True,
+                )
+
+                self.assertTrue(completed)
+                self.assertFalse(
+                    store.upload_window_satisfies(
+                        after=datetime(2026, 3, 1, tzinfo=UTC),
+                        before=datetime(2026, 3, 2, tzinfo=UTC),
+                    )
+                )
+                return (
+                    store.upload_time_has_covering_range(
+                        uploaded_time=datetime(2026, 4, 27, tzinfo=UTC),
+                        after=datetime(2026, 4, 27, tzinfo=UTC),
+                    ),
+                    store.upload_time_has_covering_range(
+                        uploaded_time=datetime(2025, 12, 31, tzinfo=UTC),
+                        after=datetime(2025, 12, 31, tzinfo=UTC),
+                    ),
+                    store.upload_time_has_covering_range(
+                        uploaded_time=datetime(2026, 4, 27, tzinfo=UTC),
+                        after=datetime(2026, 3, 1, tzinfo=UTC),
+                    ),
+                )
+
+        head_covered, older_covered, gap_covered = asyncio.run(run())
+
+        self.assertEqual(request_context.requested_cursors, ["checkpoint-cursor"])
+        self.assertTrue(head_covered)
+        self.assertTrue(older_covered)
+        self.assertFalse(gap_covered)
+
     def test_recent_pagination_stops_at_trusted_index_overlap(self) -> None:
         initial = _recent_raw("AF1QipNew", 1770000300000, "first-page-cursor")
         overlap = _recent_raw("AF1QipKnown", 1770000200000, "known-cursor")
@@ -530,6 +738,10 @@ class DownloadTraceTests(unittest.TestCase):
                         filename="known.jpg",
                         uploaded_time=datetime.fromtimestamp(1770000200000 / 1000, tz=UTC),
                     )
+                )
+                store.record_upload_coverage(
+                    oldest_upload_time=datetime(2026, 1, 1, tzinfo=UTC),
+                    newest_upload_time=datetime.fromtimestamp(1770000200000 / 1000, tz=UTC),
                 )
                 store.upsert_recent_page_checkpoint(
                     rpc_id="opaqueRecentRpc",
@@ -628,14 +840,12 @@ class DownloadTraceTests(unittest.TestCase):
         ):
             _persist_recent_payloads_from_responses(store, [raw_text])
             record = store.get_media("AF1QipCaptured")
-            covered = store.upload_coverage_satisfies(datetime(2026, 2, 3, tzinfo=UTC))
 
         self.assertIsNotNone(record)
         assert record is not None
         self.assertEqual(
             record.metadata.product_url, "https://photos.google.com/photo/AF1QipCaptured"
         )
-        self.assertTrue(covered)
 
     def test_wait_for_detail_metadata_response_returns_none_after_timeout(self) -> None:
         capture = _AsyncResponseCapture(

@@ -89,6 +89,10 @@ Valid examples include `2026-01-01`, `2026/01/01 00:00 -0800`, and
 `Jan 1 2026 12:00 AM`. If no time is provided, midnight is used. If no timezone is
 provided, the local machine timezone is used.
 
+When `--before` bounds a window already covered by the local media index, `pull` queries
+SQLite directly and skips the live `Recently added` and `/updates` refresh. Open-ended windows,
+or bounded windows newer than indexed coverage, still refresh live diagnostics first.
+
 Useful pull overrides:
 
 ```bash
@@ -134,12 +138,13 @@ separate worker pool controlled by `enrichment_concurrency`.
 ## How Pull Works
 
 1. Launches the persistent browser profile.
-2. Captures fresh `Recently added` and `/updates` diagnostics.
-3. Parses Google Photos payload shapes for exact upload/share times when available.
-4. Persists candidates in SQLite and skips already-downloaded files.
-5. Downloads originals with concurrent workers, preferring direct URLs when proven and falling
+2. For bounded windows already covered by the local index, queries SQLite directly.
+3. Otherwise captures fresh `Recently added` and `/updates` diagnostics.
+4. Parses Google Photos payload shapes for exact upload/share times when available.
+5. Persists candidates in SQLite and skips already-downloaded files.
+6. Downloads originals with concurrent workers, preferring direct URLs when proven and falling
    back to the Google Photos detail-page Download action.
-6. Finalizes downloads atomically, writes sidecar metadata, and optionally enriches sidecars from
+7. Finalizes downloads atomically, writes sidecar metadata, and optionally enriches sidecars from
    the detail page.
 
 ## Troubleshooting
