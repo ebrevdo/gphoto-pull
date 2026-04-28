@@ -44,6 +44,10 @@ Add unit tests in `tests/test_*.py`. Keep tests focused on deterministic logic s
 
 Use short, imperative commit subjects such as `Add Playwright login state capture`. Keep commits scoped to one concern. PRs should include a brief summary, notable config or selector changes, test/typecheck results, and screenshots only if browser-visible behavior changes.
 
+When preparing a release/version bump, update `pyproject.toml`, `src/gphoto_pull/__init__.py`,
+and `CHANGELOG.md` together. Move relevant entries from `Unreleased` into the new versioned
+changelog section before committing the release bump.
+
 ## Security & Configuration Tips
 
 Do not add environment-variable based configuration. Treat `gphoto-pull.toml`, config directories, downloads, diagnostics, sync DBs, browser binaries, and browser profile directories as local-only runtime data.
