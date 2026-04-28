@@ -338,6 +338,12 @@ class _DownloadTraceArtifact(msgspec.Struct, frozen=True):
     download_trace: _DownloadTraceJson
 
 
+class _TakeoutSidecarUrl(msgspec.Struct, frozen=True):
+    """Small decoded view of a local supplemental metadata sidecar."""
+
+    url: str | None = None
+
+
 @dataclass(slots=True)
 class _RecentPayloadStats:
     """Running recent payload statistics.
@@ -2480,11 +2486,16 @@ def _build_download_queue(
 
     queue: list[tuple[MediaMetadata, MediaStateRecord]] = []
     skipped_existing_count = 0
+    downloaded_media_ids = _downloaded_media_ids_from_sidecars(download_dir)
 
     for candidate, record in zip(summary.candidates, summary.persisted_records, strict=True):
         if candidate.cutoff_match is not True:
             continue
-        if _target_path_exists(record, download_dir=download_dir):
+        if _target_path_exists(
+            record,
+            download_dir=download_dir,
+            downloaded_media_ids=downloaded_media_ids,
+        ):
             skipped_existing_count += 1
             continue
         queue.append((candidate.metadata, record))
@@ -2492,28 +2503,114 @@ def _build_download_queue(
     return queue, skipped_existing_count
 
 
-def _target_path_exists(record: MediaStateRecord, *, download_dir: Path) -> bool:
+def _target_path_exists(
+    record: MediaStateRecord,
+    *,
+    download_dir: Path,
+    downloaded_media_ids: set[str] | None = None,
+) -> bool:
     """Description:
-    Check whether the current run's deterministic target file already exists.
+    Check whether the current run's media item already exists locally.
 
     Args:
         record: Persisted media index row.
         download_dir: Final download directory.
+        downloaded_media_ids: Optional pre-scanned media ids from local sidecars.
 
     Returns:
-        `True` when the final planned path exists.
+        `True` when the final planned path or another sidecar-proven local file
+        exists for the same media id.
     """
 
     primary_path = primary_download_path(download_dir, record)
-    if not primary_path.exists():
-        return False
-    sidecar_path = primary_path.with_name(f"{primary_path.name}.supplemental-metadata.json")
-    if not sidecar_path.exists():
-        return False
+    if primary_path.exists():
+        sidecar_path = primary_path.with_name(f"{primary_path.name}.supplemental-metadata.json")
+        if sidecar_path.exists():
+            try:
+                if record.metadata.media_id in sidecar_path.read_text(encoding="utf-8"):
+                    return True
+            except OSError:
+                pass
+
+    local_media_ids = (
+        _downloaded_media_ids_from_sidecars(download_dir)
+        if downloaded_media_ids is None
+        else downloaded_media_ids
+    )
+    return record.metadata.media_id in local_media_ids
+
+
+def _downloaded_media_ids_from_sidecars(download_dir: Path) -> set[str]:
+    """Description:
+    Recover already-downloaded media ids from local Takeout-style sidecars.
+
+    Args:
+        download_dir: Final download directory.
+
+    Returns:
+        Media ids with both a supplemental metadata sidecar and adjacent media
+        file.
+
+    Side Effects:
+        Reads local sidecar files.
+    """
+
+    if not download_dir.exists():
+        return set()
+
+    media_ids: set[str] = set()
     try:
-        return record.metadata.media_id in sidecar_path.read_text(encoding="utf-8")
+        sidecar_paths = download_dir.rglob("*.supplemental-metadata.json")
+        for sidecar_path in sidecar_paths:
+            if not _sidecar_media_path(sidecar_path).is_file():
+                continue
+            media_id = _media_id_from_sidecar_url(sidecar_path)
+            if media_id is not None:
+                media_ids.add(media_id)
     except OSError:
-        return False
+        return media_ids
+    return media_ids
+
+
+def _sidecar_media_path(sidecar_path: Path) -> Path:
+    """Description:
+    Resolve the media file path next to a Takeout-style sidecar.
+
+    Args:
+        sidecar_path: Supplemental metadata path.
+
+    Returns:
+        Adjacent media path implied by the sidecar filename.
+    """
+
+    return sidecar_path.with_name(sidecar_path.name.removesuffix(".supplemental-metadata.json"))
+
+
+def _media_id_from_sidecar_url(sidecar_path: Path) -> str | None:
+    """Description:
+    Extract a Google Photos media id from one local sidecar URL.
+
+    Args:
+        sidecar_path: Supplemental metadata path.
+
+    Returns:
+        Media id encoded in the sidecar URL, or `None` when unavailable.
+
+    Side Effects:
+        Reads and parses one sidecar file.
+    """
+
+    try:
+        payload = msgspec.json.decode(sidecar_path.read_bytes(), type=_TakeoutSidecarUrl)
+    except (OSError, msgspec.DecodeError):
+        return None
+
+    if payload.url is None:
+        return None
+    try:
+        return classify_photos_url(payload.url).media_id
+    except ValueError:
+        return None
 
 
 async def _download_candidates_async(
